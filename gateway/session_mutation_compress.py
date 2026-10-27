@@ -75,6 +75,12 @@ async def prepare_compress(authority, live, payload, prepared):
                 protect_first_n=options.get('protect_first_n', 3), protect_last_n=options.get('protect_last_n', 20),
                 min_tail_user_messages=max(1, _parse_config_int(options.get('min_tail_user_messages', 1), 1)),
                 custom_providers=config.get('custom_providers'))
+            # 会话 id 就在 snapshot 上，但这个临时 compressor 从没绑过 —— 不绑的话所有依赖
+            # session 的功能（recovery footer、陈旧 tool 降级、durable cooldown 键）都在空 id
+            # 下静默跑（2026-10-27 修）。缺了 footer，模型就不知道被压缩的原文还能搜回来。
+            from contextlib import suppress as _suppress_bind
+            with _suppress_bind(Exception):
+                compressor.bind_session_state(getattr(authority, "db", None), snapshot.get("target") or "")
             compressed = compressor.compress(json.loads(json.dumps(head)), force=True,
                                                focus_topic=request.focus_topic, memory_context=memory_context)
             if not any(m.get('_compressed_summary') for m in compressed):
