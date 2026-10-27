@@ -127,6 +127,9 @@ TOOLSETS = {
     "context_engine": _ts("Runtime tools exposed by the active context engine"),
     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
     "connections": _ts("Remote connector discovery, execution, and account authorization", ["manage_connections"]),
+    # [tamako-local] relay_to_owner — a group / non-owner chat forwards one text to the owner.
+    "relay": _ts("Relay one message to the owner from a non-owner chat (relay_to_owner, export_file)",
+                 ["relay_to_owner", "export_file"]),
     "project": _ts("Desktop Projects — create/switch named workspaces (GUI sessions only)", ["desktop_project"]),
     "bot_room": _ts("Verified text-only Group Chat turn capabilities"),
 

@@ -389,6 +389,31 @@ DEFAULT_CONFIG = {
         "persistent_shell": True,
     },
 
+    # [tamako-local] Host-side relay of ONE message to the owner (tools/relay_owner_tool.py).
+    # A group chat or a non-owner DM runs its terminal/file/execute_code in the offline
+    # sandbox (terminal.source_policy), so it cannot reach the send machinery or any
+    # credential. relay_to_owner runs in the GATEWAY process and forwards a single text to
+    # the owner. The target is fixed here (never a tool argument): owner_targets maps a
+    # platform to its send target; a platform absent from owner_targets falls back to that
+    # platform's entry in terminal.source_policy.owner_ids.
+    "relay": {
+        "enabled": True,
+        "owner_targets": {},        # e.g. {qqbot: "<owner openid>", weixin: "<owner openid>"}
+        "max_chars": 500,           # relay text cap
+        "min_seconds_between": 60,  # per-source rate limit
+        # [tamako-local] export_file limits: what a sandboxed chat may hand OUT to the
+        # host inbox (relay may then attach only files from that inbox).
+        "export": {
+            "container_root": "/root/export",   # only paths under this container dir
+            "max_bytes": 26214400,              # 25 MB
+            "max_files_per_turn": 3,
+            "allowed_exts": [],                 # [] = built-in media/document allowlist
+            "accept_inbound_media": True,       # relay may also attach the gateway's inbound cache
+                                                # (files someone sent); set false to allow ONLY
+                                                # files export_file put in the inbox
+        },
+    },
+
     "web": {
         "backend": "",           # shared fallback — applies to both search and extract
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")

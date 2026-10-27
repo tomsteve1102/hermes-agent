@@ -84,6 +84,7 @@ CONFIGURABLE_TOOLSETS = [
     ("context_engine",  "🧩 Context Engine",            "runtime tools from the active context engine"),
     ("session_search",  "🔎 Session Search",            "search past conversations"),
     ("connections",     "🔌 Connections",               "remote connector tools and account authorization"),
+    ("relay",           "📮 Relay to Owner",            "relay_to_owner (a non-owner chat relays one msg to the owner)"),
     ("clarify",         "❓ Clarifying Questions",      "clarify"),
     ("delegation",      "👥 Task Delegation",           "delegate_task"),
     ("cronjob",         "⏰ Cron Jobs",                 "create/list/update/pause/resume/run, with optional attached skills"),

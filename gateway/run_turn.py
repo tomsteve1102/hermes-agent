@@ -280,6 +280,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                media_urls=list(getattr(event, "media_urls", None) or []),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -449,7 +450,10 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         media_types: Optional[list[str]] = None,
     ) -> None:
         """Profile-scoping wrapper around the background agent task (mirrors ``_run_agent``)."""
-        with self._profile_scope_for_source(source):
+        from tools.terminal_scope import install_source_sandbox_scope
+        from tools.media_delivery import bind_turn_media
+
+        with self._profile_scope_for_source(source), install_source_sandbox_scope(source), bind_turn_media(media_urls):
             return await self._run_background_task_inner(
                 prompt, source, task_id, event_message_id, media_urls, media_types,
             )
@@ -993,11 +997,21 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
 
     async def _run_agent(
         self, message: str, context_prompt: str, history: list[dict[str, Any]],
-        source: SessionSource, session_id: str, **turn_kwargs,
+        source: SessionSource, session_id: str, media_urls: Optional[list[str]] = None, **turn_kwargs,
     ) -> dict[str, Any]:
         """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
-        when multiplexing is off)."""
-        with self._profile_scope_for_source(source):
+        when multiplexing is off).
+
+        [tamako-local] ``install_source_sandbox_scope`` adds the per-source sandbox policy:
+        group chats and non-owner senders run their terminal/file/execute_code inside the
+        sandbox backend for this turn, while the owner's own DMs and the CLI keep the host.
+        ``bind_turn_media`` declares THIS turn's inbound attachments so ``relay_to_owner``
+        may attach the shared inbound cache ONLY for a file this conversation just received.
+        """
+        from tools.terminal_scope import install_source_sandbox_scope
+        from tools.media_delivery import bind_turn_media
+
+        with self._profile_scope_for_source(source), install_source_sandbox_scope(source), bind_turn_media(media_urls):
             return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
 
     def _run_agent_display_settings(self, source: SessionSource) -> GatewayRunner._RunAgentDisplay:

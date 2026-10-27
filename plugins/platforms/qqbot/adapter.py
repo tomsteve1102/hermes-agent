@@ -96,16 +96,73 @@ _STT_PROVIDER_BASE_URLS = {
     "glm": "https://open.bigmodel.cn/api/coding/paas/v4"}
 _AUDIO_URL_EXTENSIONS = {".silk", ".amr", ".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"}
 
+# [tamako-local] Toolsets a QQ group/guild chat is allowed to keep.  SECURITY: this is
+# an ALLOWLIST, not a blocklist — a toolset added by a future Hermes release can never
+# leak into a group just because nobody remembered to block it.  A group keeps chat +
+# web + media, plus ``terminal`` (2026-10-09, "堵不如疏"): the group's command needs are
+# served by the per-source sandbox policy (tools/terminal_scope.install_source_sandbox_scope,
+# key ``terminal.source_policy``) which moves every group turn's terminal/file/execute_code
+# into the docker sandbox — so ``terminal`` here never reaches the host.  Private-state and
+# host-mutating toolsets stay absent: file, code_execution, computer_use, memory,
+# session_search, browser, skills, delegation, connections, todo (``code_execution`` stays
+# out on purpose: it has no approval gate, unlike terminal).
+# The ``no_mcp`` sentinel is REQUIRED: without it ``_get_platform_tools`` re-merges every
+# globally enabled MCP server, so the group still resolved to chrome-devtools + cua-driver
+# (desktop control) despite this list (verified 2026-10-09).  ``no_mcp`` makes
+# _merge_mcp_servers return no MCP server at all.  Consumed by
+# QQAdapter.toolsets_for_source().
+#
+# ``relay`` (2026-10-10) is the ONE allowlisted toolset that can send a message outward,
+# and it is deliberately safe: ``relay_to_owner`` takes no target argument, sends only to
+# the owner fixed in config, stamps the sender, and refuses the owner's own turns.  It runs
+# in the gateway process, not the sandbox, so it is how a group says "帮我给 Tom 带句话"
+# without giving the sandbox any egress.
+_GROUP_ALLOWED_TOOLSETS = ("web", "vision", "image_gen", "tts", "clarify", "no_mcp", "terminal", "relay")
+
+
+def _configured_qqbot_toolsets() -> List[str]:
+    """The configured ``platform_toolsets.qqbot`` list ([] when unset / not a list).
+
+    Read at call time so a trusted DM's list tracks config instead of a frozen copy.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+        platform_toolsets = (read_raw_config() or {}).get("platform_toolsets") or {}
+        value = platform_toolsets.get("qqbot")
+        return [str(t) for t in value] if isinstance(value, list) else []
+    except Exception:
+        return []
+
 
 class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     """QQ Bot adapter backed by the official QQ Bot WebSocket Gateway + REST API."""
 
     # QQ Bot API does not support editing sent messages.
     SUPPORTS_MESSAGE_EDITING = False
+    # [tamako-local] Native streaming (C2C only): ONE QQ message grown in place via
+    # /v2/users/{openid}/stream_messages.  Only worth it for long answers, so frames
+    # are held back until STREAM_MIN_CHARS (short replies are sent normally at the end).
+    # DISABLED 2026-10-03 on operator request (it misbehaved in the field).  The
+    # implementation below is kept intact: flip this back to True to re-enable.
+    SUPPORTS_NATIVE_STREAMING = False
+    STREAM_MIN_CHARS = 240
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     ALLOW_ALL_ENV_PREFIX = "QQ"
     _TYPING_INPUT_SECONDS = 60  # input_notify duration reported to QQ
     _TYPING_DEBOUNCE_SECONDS = 50  # refresh before it expires
+
+    # [tamako-local] QQ file-CDN download policy.  grouptalk.c2c.qq.com answers only a
+    # fraction of connections from this host: TCP connects in ~30 ms, then the TLS
+    # handshake or the response stalls until timeout.  Measured 2026-10-06 — single
+    # attempt ~30-40%, and the failures are partly per-address (inside one second one A
+    # record talks while its neighbour stalls: 4/8 rounds mixed) and partly time windows
+    # where every address stalls (3/8 rounds, ~20-30 s long).  Retrying the same address
+    # barely helped (1 recovery in 7 first-failures) while changing address helped more
+    # (2/7), so every attempt below goes to a different resolved address.
+    _DOWNLOAD_ATTEMPTS = 4  # attempt 1 = plain hostname, then one per distinct address
+    _DOWNLOAD_CONNECT_TIMEOUT = 6.0  # per attempt; httpcore charges the TLS handshake here
+    _DOWNLOAD_READ_TIMEOUT = 20.0  # body reads: room for a slow-but-moving transfer
+    _DOWNLOAD_RETRY_DELAY = 1.0  # seconds; linear backoff (1s, 2s, 3s)
 
     # WS close codes that are unrecoverable → stop reconnecting.
     _FATAL_CLOSE_CODES = {

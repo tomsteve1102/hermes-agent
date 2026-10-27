@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from pathlib import Path
@@ -221,3 +222,195 @@ def install_and_reset_profile_terminal_scope(hermes_home: Any) -> Iterator[None]
         yield
     finally:
         reset_terminal_scope(token)
+
+
+# ---------------------------------------------------------------------------
+# [tamako-local] Per-source sandbox policy (2026-10-09)
+#
+# Hermes resolves the terminal backend per PROFILE, so one gateway serving one
+# profile gives every chat the same execution backend. This adds a per-TURN
+# override on top: when the turn's source is a group chat (always) or a sender
+# that is not a configured owner, the turn runs under a sandbox policy — by
+# default the docker backend on the group sandbox image — instead of the
+# profile's host policy. terminal, file and execute_code all read this scope, so
+# the three move into the sandbox together.
+#
+# Fail-closed: the sandbox baseline below is hardcoded (config only overrides
+# keys), and a policy that cannot be built installs a REFUSAL scope (terminal
+# refuses to run) instead of silently inheriting host authority. A source-less
+# turn (CLI, cron, TUI, dashboard) is never touched.
+# ---------------------------------------------------------------------------
+
+_GROUP_CHAT_TYPES = frozenset({"group", "guild", "channel", "forum"})
+
+# Hardcoded sandbox baseline; ``terminal.source_policy.sandbox`` overrides any key.
+_SANDBOX_POLICY_DEFAULTS: dict[str, Any] = {
+    "backend": "docker",
+    "docker_image": "hermes-sandbox:group",
+    "docker_network": False,                 # --network=none
+    "docker_mount_cwd_to_workspace": False,  # no host cwd inside the container
+    "docker_volumes": [],                    # no host paths at all
+    "docker_forward_env": [],
+    "docker_env": {},
+    "container_persistent": False,           # one fresh container per session
+    "cwd": "/root",
+}
+
+_SOURCE_POLICY_KEY = "source_policy"
+
+
+def read_source_policy(config: Optional[dict] = None) -> dict:
+    """``terminal.source_policy`` from the active profile's config.yaml ({} when absent)."""
+    if config is None:
+        try:
+            from hermes_cli.config import read_raw_config
+
+            config = read_raw_config()
+        except Exception as exc:  # pragma: no cover - config read failure
+            logger.warning("source sandbox policy: cannot read config (%s)", exc)
+            return {}
+    terminal = (config or {}).get("terminal")
+    policy = terminal.get(_SOURCE_POLICY_KEY) if isinstance(terminal, dict) else None
+    return policy if isinstance(policy, dict) else {}
+
+
+def _source_sender_key(source: Any) -> str:
+    """``"<platform>:<user_id>"`` for owner matching; "" when either side is missing."""
+    platform = getattr(source, "platform", None)
+    platform_value = str(getattr(platform, "value", platform) or "").strip().lower()
+    user_id = str(getattr(source, "user_id", "") or "").strip()
+    return f"{platform_value}:{user_id}".lower() if platform_value and user_id else ""
+
+
+def _policy_id_set(policy: Optional[dict], key: str) -> set[str]:
+    """Lower-cased ``"<platform>:<user_id>"`` entries under *policy[key]* ([] when absent).
+
+    Tolerates a list OR a list-literal/space/comma string (``hermes config set`` can
+    persist a list value as a string), so a hand-set entry never silently fails open.
+    """
+    raw = (policy or {}).get(key)
+    if not raw:
+        return set()
+    if isinstance(raw, str):
+        items = [p for p in re.split(r"[,\s]+", raw.strip().strip("[]").replace("'", "").replace('"', "")) if p]
+    elif isinstance(raw, (list, tuple, set)):
+        items = list(raw)
+    else:
+        items = []
+    return {str(x).strip().lower() for x in items if str(x).strip()}
+
+
+def source_needs_sandbox(source: Any, policy: Optional[dict]) -> bool:
+    """Whether this turn must run in the sandbox.
+
+    Group/guild chats → always (no member, owner included, runs on the host).
+    Any other chat    → unless the sender is a configured OWNER or a TRUSTED id;
+                        fail-closed, so an unclassifiable or unknown sender lands
+                        in the sandbox.
+    No source at all  → never (CLI, cron, TUI, dashboard keep the profile policy).
+
+    ``trusted_ids`` ([tamako-local]) is the same host treatment as ``owner_ids`` for a
+    named friend who needs real host access; groups stay sandboxed regardless.
+    """
+    if source is None or not (policy or {}).get("enabled"):
+        return False
+    try:
+        chat_type = str(getattr(source, "chat_type", "") or "").strip().lower()
+        if chat_type in _GROUP_CHAT_TYPES:
+            return True
+        allowed_host = _policy_id_set(policy, "owner_ids") | _policy_id_set(policy, "trusted_ids")
+        return _source_sender_key(source) not in allowed_host
+    except Exception:
+        return True  # fail closed: an unclassifiable source is a sandbox source
+
+
+def trusted_sender(source: Any, policy: Optional[dict] = None) -> bool:
+    """True when *source*'s sender is named in ``terminal.source_policy.trusted_ids``.
+
+    A host-trusted DM runs on the host; callers use this to drop the sandbox-era
+    ``relay`` toolset (terminal already covers sending/file access there). Fail-closed:
+    an unreadable policy or an unclassifiable source is NOT trusted.
+    """
+    try:
+        policy = read_source_policy() if policy is None else policy
+        key = _source_sender_key(source)
+        return bool(key) and key in _policy_id_set(policy, "trusted_ids")
+    except Exception:
+        return False
+
+
+def owner_sender(source: Any, policy: Optional[dict] = None) -> bool:
+    """True when *source*'s sender is named in ``terminal.source_policy.owner_ids``.
+
+    The operator's own DM. Callers use this to grant the operator an extra toolset that
+    must NOT reach every paired friend's DM — adding it to ``platform_toolsets.<p>``
+    would do exactly that (see QQAdapter.toolsets_for_source and the ``cronjob`` case:
+    a job runs as a source-less, host-privileged cron session, so handing the tool to a
+    friend's sandboxed DM is a sandbox escape).
+    Fail-closed: an unreadable policy or an unclassifiable source is NOT the owner.
+    """
+    try:
+        policy = read_source_policy() if policy is None else policy
+        key = _source_sender_key(source)
+        return bool(key) and key in _policy_id_set(policy, "owner_ids")
+    except Exception:
+        return False
+
+
+def build_source_sandbox_scope(
+    source: Any, *, config: Optional[dict] = None, hermes_home: Any = None
+) -> Optional[dict[str, str]]:
+    """Sandbox terminal policy for *source*, or ``None`` when the profile policy stands.
+
+    The returned mapping is COMPLETE (profile policy projected, then the sandbox keys
+    overlaid), so a bound scope never widens back to ambient authority.
+    """
+    policy = read_source_policy(config)
+    if not source_needs_sandbox(source, policy):
+        return None
+    if hermes_home is None:
+        try:
+            from hermes_constants import get_hermes_home
+
+            hermes_home = get_hermes_home()
+        except Exception:
+            hermes_home = None
+    base = build_profile_terminal_scope(hermes_home) if hermes_home else {}
+    from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP, _terminal_env_value
+
+    merged = {**_SANDBOX_POLICY_DEFAULTS, **(policy.get("sandbox") or {})}
+    for key, value in merged.items():
+        env_var = TERMINAL_CONFIG_ENV_MAP.get(key)
+        if not env_var:
+            logger.warning("terminal.source_policy.sandbox: unknown key %r ignored", key)
+            continue
+        base[env_var] = _terminal_env_value(value)
+    # The sandbox image is the user's explicit choice — never re-derived from defaults.
+    base["TERMINAL_DOCKER_IMAGE_PINNED"] = "1"
+    return base
+
+
+@contextmanager
+def install_source_sandbox_scope(source: Any) -> Iterator[None]:
+    """Install the sandbox policy for one turn when *source* requires it. Never raises;
+    a sandbox turn whose policy cannot be built gets the refusal scope (fail closed)."""
+    token: Optional[Token] = None
+    policy = read_source_policy()
+    if source_needs_sandbox(source, policy):
+        try:
+            token = set_terminal_scope(
+                build_source_sandbox_scope(
+                    source, config={"terminal": {_SOURCE_POLICY_KEY: policy}}
+                )
+            )
+        except TerminalPolicyUnavailable as exc:
+            logger.warning("source sandbox policy unavailable: %s", exc)
+            token = _terminal_scope_var.set(TerminalPolicyRefusal(str(exc)))
+        except Exception as exc:
+            logger.warning("source sandbox policy build failed: %s", exc)
+            token = _terminal_scope_var.set(TerminalPolicyRefusal(str(exc)))
+    try:
+        yield
+    finally:
+        if token is not None:
+            reset_terminal_scope(token)
