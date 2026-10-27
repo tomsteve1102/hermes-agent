@@ -185,6 +185,10 @@ def is_native_gemini_base_url(base_url: str) -> bool:
     normalized = str(base_url or "").strip().rstrip("/").lower()
     if normalized.endswith("/openai"):
         return False
+    if "opencode.ai/" in normalized and "/google/" in normalized:
+        # OpenCode Go 的 Gemini 原生端点（/inference/go/google/v1beta）：同样是
+        # generateContent 方言 + x-goog-api-key 认证，走原生适配器才通。
+        return True
     return "generativelanguage.googleapis.com" in normalized or is_vertex_express_base_url(normalized)
 
 

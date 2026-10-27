@@ -62,6 +62,45 @@ def test_startup_route_non_aggregator_current_provider_still_routes(monkeypatch)
     assert route == model_switch.StartupModelRoute("deepseek-v4-pro", "nous", "")
 
 
+def test_startup_route_keeps_named_provider_declared_slash_model(monkeypatch):
+    """A proxy-native id containing a slash must not be re-routed to the sibling vendor block.
+
+    ``deepseek/deepseek-v4-flash`` is commandcode's own catalog id. When the selected provider
+    DECLARES that exact id, a ``providers.deepseek`` block must not steal the route (it would
+    strip the prefix and send the reseller's id to the direct vendor, which 400s every turn).
+    """
+    monkeypatch.setattr(model_switch, "DIRECT_ALIASES", {})
+    route = model_switch.resolve_startup_model_route(
+        "deepseek/deepseek-v4-flash",
+        current_provider="commandcode",
+        user_providers={
+            "deepseek": {"base_url": "https://api.deepseek.com/v1"},
+            "commandcode": {
+                "base_url": "https://api.commandcode.ai/provider/v1",
+                "models": {"deepseek/deepseek-v4-flash": {}},
+            },
+        },
+    )
+    assert route is None
+
+
+def test_startup_route_undeclared_prefix_still_routes_to_vendor(monkeypatch):
+    """Guard must not over-fire: an id the selected provider does NOT declare keeps hijack-ability."""
+    monkeypatch.setattr(model_switch, "DIRECT_ALIASES", {})
+    route = model_switch.resolve_startup_model_route(
+        "deepseek/deepseek-v4.1-flash",
+        current_provider="commandcode",
+        user_providers={
+            "deepseek": {"base_url": "https://api.deepseek.com/v1"},
+            "commandcode": {
+                "base_url": "https://api.commandcode.ai/provider/v1",
+                "models": {"z-ai/glm-5.3-flash": {}},
+            },
+        },
+    )
+    assert route == model_switch.StartupModelRoute("deepseek-v4.1-flash", "deepseek", "")
+
+
 def test_startup_route_resolves_dict_alias_and_preserves_endpoint(monkeypatch):
     monkeypatch.setattr(
         model_switch,

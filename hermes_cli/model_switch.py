@@ -356,6 +356,45 @@ class StartupModelRoute(NamedTuple):
     api_key: str = ""
 
 
+def _configured_provider_declares_model(
+    provider: str,
+    model: str,
+    user_providers: Optional[dict],
+    custom_providers: Optional[list],
+) -> bool:
+    """Whether *model* is an exact catalog member of the configured *provider*.
+
+    Local hardening of #105604 semantics: a proxy/reseller's own id contains a slash
+    (``deepseek/deepseek-v4.1-flash`` on commandcode); when the selected provider DECLARES that
+    exact id, the prefix is part of the id, not a different configured provider — so a sibling
+    ``providers.<vendor>`` block must not steal the route."""
+    identity = _clean(provider).lower()
+    target = _clean(model).lower()
+    if not identity or not target:
+        return False
+
+    keyed_entries = user_providers.items() if isinstance(user_providers, dict) else ()
+    entries = [
+        (str(key), entry)
+        for key, entry in keyed_entries
+        if isinstance(entry, dict)
+    ]
+    entries.extend(
+        (str(entry.get("provider_key") or ""), entry)
+        for entry in (custom_providers if isinstance(custom_providers, list) else [])
+        if isinstance(entry, dict)
+    )
+    for provider_key, entry in entries:
+        if identity not in custom_provider_aliases(
+            str(entry.get("name") or ""), provider_key
+        ):
+            continue
+        declared = _declared_model_ids(entry.get("models"))
+        declared.extend([entry.get("model"), entry.get("default_model")])
+        return any(_clean(candidate).lower() == target for candidate in declared)
+    return False
+
+
 def resolve_startup_model_route(
     raw_model: str, *, explicit_provider: str = "", current_provider: str = "",
     user_providers: Optional[dict] = None,
@@ -410,6 +449,13 @@ def resolve_startup_model_route(
         return None
     prefix, model = (part.strip() for part in raw.split("/", 1))
     if not prefix or not model:
+        return None
+
+    # A slash can be part of a proxy-native model ID. Honor an exact declaration on the selected
+    # provider before interpreting the prefix as a different configured provider (#105604).
+    if _configured_provider_declares_model(
+        current_provider, raw, user_providers, custom_providers
+    ):
         return None
 
     if current_provider:

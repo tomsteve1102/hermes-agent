@@ -2209,7 +2209,10 @@ def opencode_provider_family(provider_id: Optional[str]) -> Optional[str]:
     canonical = normalize_provider(provider_id)
     if canonical in _OPENCODE_FAMILIES:
         return canonical
-    return next((f for f in _OPENCODE_FAMILIES if raw.startswith(f)), None)
+    # Hyphen-boundary, not a bare prefix: ``opencode-google`` (the gemini-native relay under
+    # /inference/go/google) starts with "opencode-go" but is NOT the Go family — matching it there
+    # applied the Go relay's /v1 base-url heal and 404'd every gemini model.
+    return next((f for f in _OPENCODE_FAMILIES if raw == f or raw.startswith(f + "-")), None)
 
 
 def normalize_opencode_model_id(provider_id: Optional[str], model_id: Optional[str]) -> str:

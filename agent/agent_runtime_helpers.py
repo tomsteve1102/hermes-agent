@@ -1966,6 +1966,19 @@ def _gemini_native_client(agent, client_kwargs: dict, httpx_verify, *, reason: s
         keepalive_http = agent._build_keepalive_http_client(base_url, verify=httpx_verify)
         if keepalive_http is not None:
             safe_kwargs["http_client"] = keepalive_http
+    # OpenCode relays reject a request without ``x-opencode-session`` (HTTP 400 MissingSessionID).
+    # The OpenAI path merges that affinity header per request; the native adapter only reads
+    # ``default_headers``, so merge it into the client defaults here.
+    try:
+        from agent.opencode_affinity import merge_session_affinity_headers
+        _merged = merge_session_affinity_headers(
+            {"extra_headers": dict(safe_kwargs.get("default_headers") or {})},
+            str(getattr(agent, "provider", "") or ""), base_url,
+        )
+        if _merged.get("extra_headers"):
+            safe_kwargs["default_headers"] = _merged["extra_headers"]
+    except Exception:
+        _ra().logger.debug("opencode affinity header merge skipped", exc_info=True)
     client = GeminiNativeClient(**safe_kwargs)
     _ra().logger.info(
         "Gemini native client created (%s, shared=%s) %s", reason, shared, agent._client_log_context()
@@ -2032,8 +2045,12 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent.provider, reason, shared, agent._client_log_context(),
         )
         return provider_client
-    from agent.auxiliary_client import _GEMINI_NATIVE_PROVIDER_NAMES
-    if agent.provider in _GEMINI_NATIVE_PROVIDER_NAMES:
+    from agent.auxiliary_client import _is_gemini_native_route
+    _provider_norm = str(getattr(agent, "provider", "") or "").strip().lower()
+    # Provider name OR base-url shape: a custom entry pointing at a Gemini-native endpoint
+    # (opencode.ai/inference/go/google/v1beta, a Vertex express base) is not named "gemini",
+    # but that relay has no OpenAI surface — /chat/completions 404s there, generateContent works.
+    if _is_gemini_native_route(_provider_norm, str(client_kwargs.get("base_url", "") or "")):
         client = _gemini_native_client(agent, client_kwargs, httpx_verify, reason=reason, shared=shared)
         if client is not None:
             return client

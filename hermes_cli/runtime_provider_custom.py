@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 from hermes_cli.providers import custom_provider_aliases, custom_provider_slug
 from agent.custom_entry_pool import custom_entry_for_endpoint, entry_declares_credential, entry_scoped_pool
@@ -676,7 +677,12 @@ def _opencode_family_for_custom(requested_provider: str, base_url: str) -> Optio
         return family
     try:
         if base_url_hostname(base_url).lower() == "opencode.ai":
-            return "opencode-go" if "/zen/go" in base_url.lower() else "opencode-zen"
+            # Only the zen relays (``/zen``, ``/zen/go``, optionally ``/v1``) are the OpenCode
+            # family. Other opencode.ai paths — the gemini-native relay under
+            # ``/inference/go/google/v1beta`` — must not inherit the family's /v1 base-url heal.
+            path = (urlparse(base_url).path or "").rstrip("/").lower()
+            if path in ("/zen", "/zen/v1", "/zen/go", "/zen/go/v1"):
+                return "opencode-go" if path.startswith("/zen/go") else "opencode-zen"
     except Exception:
         pass
     return None
