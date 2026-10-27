@@ -1192,6 +1192,35 @@ MEDIA_DELIVERY_EXTS: tuple[str, ...] = (
 # Bare extensions (no dot) longest-first so a shorter ext never matches as a prefix of a longer one.
 _MEDIA_EXT_ALTERNATION = "|".join(sorted((e.lstrip(".") for e in MEDIA_DELIVERY_EXTS), key=len, reverse=True))
 
+# Files a bare path *mentioned* in a reply must never auto-attach. Quoting a path — in an error
+# message, a slash-command listing, a pending-memory body — otherwise ships that file to the
+# chat, and "should this go out?" is never answered by "someone happened to write the path down".
+#
+# Deny-by-root is the whole rule (the owner's call, 2026-09-28): everything under the agent's own state tree
+# and the two personal project trees stays put; a mention stays visible as text and attaches
+# nothing. Anything actually meant to be sent goes out through an explicit ``MEDIA:`` tag — a
+# separate channel that never reaches this detector — so "I need that file" always has an answer.
+_NO_AUTO_ATTACH_ROOTS = (
+    r"D:\program",
+    r"D:\files\work",
+)
+# Also by name, wherever it lives: identity, memory and the diary are private state even when a
+# copy sits outside those trees (a Desktop copy can carry a stale SOUL.md).
+_MENTION_ONLY_BASENAMES = frozenset({"soul.md", "memory.md", "user.md", "diary.md"})
+
+
+def _is_mention_only_path(path: str) -> bool:
+    """True when *path* must not be auto-attached from a mention (an explicit ``MEDIA:`` can)."""
+    resolved = os.path.realpath(path)
+    if os.path.basename(resolved).lower() in _MENTION_ONLY_BASENAMES:
+        return True
+    roots = [os.path.realpath(r) for r in _NO_AUTO_ATTACH_ROOTS]
+    try:
+        roots.append(os.path.realpath(str(get_hermes_home())))
+    except Exception:
+        pass
+    return any(resolved == root or resolved.startswith(root + os.sep) for root in roots)
+
 # Anchored ``MEDIA:<path>`` cleanup pattern (dispatch path + streaming consumer). Strips only tags
 # whose path ends in a deliverable extension (optionally quoted/backticked); unknown-ext tags stay
 # for the bare-path detector. Rules: anchors ``~/``, ``/``, ``X:\`` / ``X:/``; up to 3 quote/
@@ -3289,6 +3318,13 @@ class BasePlatformAdapter(ABC):
             raw = match.group(0)
             expanded = os.path.expanduser(raw)
             if os.path.isfile(expanded):
+                if _is_mention_only_path(expanded):
+                    # Internal state the reply merely referenced: keep the text for the reader,
+                    # attach nothing. Only an explicit ``MEDIA:`` tag may send these.
+                    logger.info(
+                        "Not auto-attaching Hermes-internal file (mentioned, not offered): %s",
+                        _log_safe_path(raw))
+                    continue
                 unique.setdefault(expanded, raw)
             else:
                 # Most common reason a promised file never arrives — log the gap.

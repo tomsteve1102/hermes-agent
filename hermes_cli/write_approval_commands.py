@@ -4,9 +4,25 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import List, Optional
 
 from tools import write_approval as wa
+
+# Bare absolute paths inside a pending record (summary, matched entry) are context for the
+# approver, not a delivery. The gateway's ``extract_local_files`` auto-attaches any bare path
+# that exists on disk and then deletes it from the text — so listing a pending write whose
+# body quotes a file would ship that file to the user unrequested (and blank the listing).
+# Backtick-wrapping makes that extractor skip them: it skips inline-code spans.
+_BARE_PATH_RE = re.compile(
+    r"(?<![/:\w.`])(?:~/|/|[A-Za-z]:[/\\])(?:[\w.\-]+[/\\])*[\w.\-]+\.[\w]+"
+)
+
+
+def _neutralize_paths(text: str) -> str:
+    """Backtick bare absolute paths so a listing never auto-attaches a file."""
+    return _BARE_PATH_RE.sub(lambda m: f"`{m.group(0)}`", text) if text else text
+
 
 
 def _fmt_state(subsystem: str) -> str:
@@ -42,19 +58,25 @@ def handle_pending_subcommand(
     other handling (e.g. /skills search).
     """
     if not args:
-        return f"{_fmt_state(subsystem)}\n\n" + _fmt_pending_list(subsystem)
-    sub, rest = args[0].lower(), args[1:]
-    if sub == "pending":
-        return _fmt_pending_list(subsystem)
-    if sub in {"approve", "apply"}:
-        return _approve(subsystem, rest, memory_store)
-    if sub in {"reject", "deny", "drop"}:
-        return _reject(subsystem, rest)
-    if sub == "diff" and subsystem == wa.SKILLS:
-        return _diff(rest)
-    if sub in {"approval", "mode"}:  # 'mode' kept as a back-compat alias
-        return _set_approval(subsystem, rest, set_mode_fn)
-    return None  # not ours — caller handles
+        out = f"{_fmt_state(subsystem)}\n\n" + _fmt_pending_list(subsystem)
+    else:
+        sub, rest = args[0].lower(), args[1:]
+        if sub == "pending":
+            out = _fmt_pending_list(subsystem)
+        elif sub in {"approve", "apply"}:
+            out = _approve(subsystem, rest, memory_store)
+        elif sub in {"reject", "deny", "drop"}:
+            out = _reject(subsystem, rest)
+        elif sub == "diff" and subsystem == wa.SKILLS:
+            out = _diff(rest)
+        elif sub in {"approval", "mode"}:  # 'mode' kept as a back-compat alias
+            out = _set_approval(subsystem, rest, set_mode_fn)
+        else:
+            return None  # not ours — caller handles
+    # Every branch echoes entry text back to the user — the listing, but also the *applied*
+    # result of an approve (which prints the entry it wrote). Backtick bare paths at this one
+    # exit so no branch can auto-attach a file downstream via the gateway's bare-path detector.
+    return _neutralize_paths(out)
 
 
 def _usage(subsystem: str) -> str:

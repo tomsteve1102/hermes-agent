@@ -220,5 +220,57 @@ class TestEdgeCases:
             assert len(paths) == 1, f"Failed with suffix '{suffix}'"
 
 
+class TestMentionOnlyInternalFiles:
+    """Hermes-internal state must not ride the bare-path detector.
+
+    A reply that merely MENTIONS SOUL.md / MEMORY.md / the diary / credentials used to
+    auto-attach that file — and blank the path out of the text. Only an explicit
+    ``MEDIA:`` tag may send them.
+    """
+
+    @pytest.mark.parametrize("rel", [
+        "SOUL.md",
+        "memories/MEMORY.md",
+        "memories/USER.md",
+        "auth.json",
+        "pairing/qqbot-approved.json",
+        "sessions/transcript.json",
+    ])
+    def test_internal_path_is_mentioned_not_attached(self, rel):
+        from hermes_constants import get_hermes_home
+
+        target = str(get_hermes_home() / rel)
+        paths, cleaned = _extract(f"pending write references {target} for detail")
+        assert paths == []
+        assert target in cleaned  # the reader still sees the path
+
+    @pytest.mark.parametrize("target", [
+        r"D:\program\demo\expense\exports\report.pdf",
+        r"D:\files\work\demo\quote.docx",
+        r"D:\program\demo\comfyui\samples\preview_00007_.png",
+    ])
+    def test_project_tree_paths_never_auto_attach(self, target):
+        """Nothing under D:\\program or D:\\files\\work rides the bare-path detector.
+
+        The owner's rule (2026-09-28): those two trees plus HERMES_HOME are deny-by-root — a mention
+        stays text. Real deliveries go through an explicit MEDIA: tag, which is a different
+        channel and never reaches this detector.
+        """
+        paths, cleaned = _extract(f"已生成 {target} 你可以看看")
+        assert paths == []
+        assert target in cleaned
+
+    @pytest.mark.parametrize("target", [
+        "/root/out/report.pdf",
+        "D:/work/quote.xlsx",
+        "/home/user/photos/cat.jpg",
+    ])
+    def test_ordinary_deliverable_still_attaches(self, target):
+        """The guard must not swallow normal deliverables."""
+        paths, cleaned = _extract(f"ready: {target} enjoy")
+        assert paths == [target]
+        assert target not in cleaned
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
