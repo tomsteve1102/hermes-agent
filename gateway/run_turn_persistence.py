@@ -94,6 +94,36 @@ class GatewayTurnPersistenceMixin:
                 _platform_name, source.chat_id or "unknown",
             )
 
+        # [tamako-local] Guard against reasoning-only promotion leaking chain-of-thought.
+        # agent/turn_final_response.py promotes a turn's *reasoning* into final_response when the
+        # model returns empty content with finish_reason=stop ("Reasoning-only clean stop") — a
+        # rescue for parsers that misfile the real answer as reasoning. But when the model instead
+        # genuinely stalls inside its chain-of-thought, that ships raw CoT into the chat (seen on
+        # QQ 2026-10-04, model=deepseek-v4.1-flash). On platforms whose effective show_reasoning
+        # is OFF, drop it so the empty-response handling below applies. The promoted text is never
+        # written into the assistant row's ``content`` (it stays in the reasoning fields /
+        # api_content sidecar), so conversation history remains clean either way.
+        if response and not _intentional_silence:
+            try:
+                from gateway.run import (
+                    _load_gateway_config, _platform_config_key, _resolve_gateway_display_bool,
+                )
+                _sr_effective = _resolve_gateway_display_bool(
+                    _load_gateway_config(), _platform_config_key(source.platform), "show_reasoning",
+                    default=bool(getattr(self, "_show_reasoning", False)), platform=source.platform,
+                )
+            except Exception:
+                _sr_effective = bool(getattr(self, "_show_reasoning", False))
+            if not _sr_effective:
+                _promoted_reasoning = str(agent_result.get("last_reasoning") or "").strip()
+                if _promoted_reasoning and response.strip() == _promoted_reasoning:
+                    logger.warning(
+                        "[tamako-local] reasoning-only promoted reply suppressed "
+                        "(platform=%s chat=%s, %d chars) — chain-of-thought not delivered",
+                        _platform_name, source.chat_id or "?", len(response),
+                    )
+                    response = ""
+
         # "(empty)" = the model produced no visible content after exhausting all retries. One
         # text with the CLI explainer and the desktop (agent/turn_explainers.py) so the user
         # reads the same words on every surface.
