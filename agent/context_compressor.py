@@ -5546,7 +5546,63 @@ Write only the summary body. Do not include any preamble or prefix."""
             )
         # Phase 4: Assemble compressed message list
         compressed = self._assemble_compressed(messages, compress_start, compress_end, scan, summary)
+        if self._run_compression_gate(
+            messages, compressed, compress_start, compress_end, n_messages, telemetry, force,
+        ):
+            return canonical_messages
         return self._finalize_compressed(compressed, canonical_messages, n_messages, spare_pending_images, pruned_count)
+
+    def _run_compression_gate(
+        self,
+        before_messages: list[dict[str, Any]],
+        assembled: list[dict[str, Any]],
+        compress_start: int,
+        compress_end: int,
+        n_messages: int,
+        telemetry: dict[str, Any],
+        force: bool = False,
+    ) -> bool:
+        """提交前的两道门禁（2026-10-27）。返回 True＝拒绝，调用方原样返回历史。
+
+        Fail-open：门禁自己出错时放行，绝不让它拦下正常压缩。
+        """
+        # 每次进来先清上次的拒绝标记：压缩恢复正常后，manual 提示不该还挂着老原因。
+        self._gate_rejection_reason = None
+        self._gate_rejection_folded_user_turns = None
+        try:
+            from agent.compression_gates import evaluate, gate_enabled
+
+            if not gate_enabled():
+                return False
+            folded = before_messages[compress_start:compress_end]
+            # force=True 是手动 /compress —— 用户明确要求压，只保留"净缩减"那道硬判；
+            # 用户回合数是启发式，用它否决用户会让 /compress 看起来毫无反应。
+            verdict = evaluate(before_messages, assembled, folded, enforce_user_turns=not force)
+        except Exception as exc:  # 门禁是纯增益，坏了不能影响压缩主路径
+            logger.debug("compression gate skipped (fail-open): %s", exc)
+            return False
+
+        if not verdict.rejected:
+            telemetry["compression_gate"] = "ok"
+            telemetry["compression_gate_saved_pct"] = round(verdict.saved_pct, 2)
+            if verdict.folded_user_turns:
+                telemetry["compression_gate_folded_user_turns"] = verdict.folded_user_turns
+            return False
+
+        telemetry["compression_gate"] = verdict.reason
+        telemetry["failure_class"] = telemetry.get("failure_class") or "gate_rejected"
+        telemetry["compression_gate_folded_user_turns"] = verdict.folded_user_turns
+        self._last_compression_savings_pct = 0.0
+        self._gate_rejection_reason = verdict.reason
+        self._gate_rejection_folded_user_turns = verdict.folded_user_turns
+        # 复用现成的结构性退避：既写了日志，也避免下一轮立刻重试同一份 transcript。
+        self._record_structural_no_op("gate:" + verdict.reason, n_messages)
+        logger.warning(
+            "Compression gate rejected (%s): %d -> %d tokens (saved %d, %.1f%%), history kept intact",
+            verdict.reason, verdict.before_tokens, verdict.after_tokens,
+            verdict.saved_tokens, verdict.saved_pct,
+        )
+        return True
 
     def _assemble_compressed(
         self, messages: list[dict[str, Any]], compress_start: int, compress_end: int, scan: _HandoffScan, summary: str,

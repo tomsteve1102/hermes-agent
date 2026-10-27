@@ -48,6 +48,11 @@ def summarize_manual_compression(
     failure_reason = getattr(compression_state, "_last_summary_error", None)
     if not isinstance(failure_reason, str) or not failure_reason.strip():
         failure_reason = None
+    # 门禁拒绝（2026-10-27）：compress() 原样返回历史，noop 会是 True，
+    # 只说 "No changes" 会让人以为没什么可压 —— 得说清是被拦了、为什么。
+    gate_rejection = getattr(compression_state, "_gate_rejection_reason", None)
+    if not isinstance(gate_rejection, str) or not gate_rejection.strip():
+        gate_rejection = None
 
     note = None
     if refused_would_grow:
@@ -65,6 +70,22 @@ def summarize_manual_compression(
             "Summary generation failed; Hermes used limited fallback context "
             f"and removed {dropped_count} message(s)."
         )
+    elif gate_rejection:
+        headline = f"Compression blocked by gate: {before_count} messages preserved"
+        gate_turns = getattr(compression_state, "_gate_rejection_folded_user_turns", None)
+        if gate_rejection.startswith("folded_user_turns="):
+            shown = gate_turns if isinstance(gate_turns, int) and gate_turns else gate_rejection.split("=", 1)[-1]
+            note = (
+                f"This window would have folded {shown} messages of your own into the summary — "
+                "past the safety limit — so the transcript was kept intact. Nothing was lost. "
+                "Auto-compaction will retry once the window is narrower."
+            )
+        elif gate_rejection == "no_net_shrink":
+            note = "The assembled result was not smaller than the input, so nothing was removed."
+        elif gate_rejection == "empty_result":
+            note = "The assembled result came back empty, so nothing was removed."
+        else:
+            note = f"Gate reason: {gate_rejection}. Nothing was removed."
     elif noop:
         headline = f"No changes from compression: {before_count} messages"
     else:
