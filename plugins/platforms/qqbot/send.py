@@ -34,7 +34,7 @@ def _qqbot_media_file_type(media_path: str, is_voice: bool) -> int:
 
 async def _qqbot_api_json(client, headers: dict, method: str, path: str,
                           body: dict | None = None, *, timeout: float = 30.0) -> dict:
-    """POST/GET JSON against ``api.sgroup.qq.com``; raise RuntimeError on failure."""
+    """POST/GET JSON against ``API_BASE``; raise RuntimeError on failure."""
     from .constants import API_BASE
 
     resp = await client.request(method, f"{API_BASE}{path}", json=body, headers=headers, timeout=timeout)
@@ -104,10 +104,11 @@ async def _qqbot_send_media_message(client, headers, chat_type, chat_id, file_in
 
 async def _qqbot_send_text_message(client, headers, chat_id, message: str) -> dict:
     """Try channel → C2C → group text endpoints (pre-media standalone behavior)."""
+    from .constants import API_BASE
     payload = {"content": (message or "")[:4000], "msg_type": 0}
-    endpoints = (("channel", f"https://api.sgroup.qq.com/channels/{chat_id}/messages"),
-                 ("c2c", f"https://api.sgroup.qq.com/v2/users/{chat_id}/messages"),
-                 ("group", f"https://api.sgroup.qq.com/v2/groups/{chat_id}/messages"))
+    endpoints = (("channel", f"{API_BASE}/channels/{chat_id}/messages"),
+                 ("c2c", f"{API_BASE}/v2/users/{chat_id}/messages"),
+                 ("group", f"{API_BASE}/v2/groups/{chat_id}/messages"))
     statuses = []
     for kind, url in endpoints:
         resp = await client.post(url, json=payload, headers=headers)

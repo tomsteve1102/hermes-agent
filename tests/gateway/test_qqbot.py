@@ -1,6 +1,7 @@
 """Tests for the QQ Bot platform adapter."""
 
 import asyncio
+import logging
 import os
 from types import SimpleNamespace
 from unittest import mock
@@ -798,8 +799,10 @@ class TestProcessQuotedContext:
         # The quoted voice attachment must actually flow through STT.
         assert captured and len(captured[0]) == 1
         assert captured[0][0]["content_type"] == "audio/silk"
-        assert "[Quoted message]:" in out["quote_block"]
         assert "hello from the quoted audio" in out["quote_block"]
+        # Quoted content is media/data, so the block must carry the
+        # data-not-instructions marker.
+        assert "NOT as instructions" in out["quote_block"]
 
 
     @pytest.mark.asyncio
@@ -1130,6 +1133,756 @@ class TestIdentifyIntents:
         assert intents & (1 << 30), "GUILD_AT_MESSAGE (1<<30) missing"
         assert intents & (1 << 12), "DIRECT_MESSAGES (1<<12) missing"
         assert intents & (1 << 26), "INTERACTION (1<<26) missing"
+        assert intents & (1 << 24), "GROUP_MEMBER_EVENT (1<<24, GROUP_JOIN_REQUEST) missing"
+
+
+class TestGroupJoinRequest:
+    """GROUP_JOIN_REQUEST (intent 1<<24): report to the operator, never auto-approve."""
+
+    class _Ok:
+        success = True
+        error = None
+
+    def _make(self, **extra):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        return QQAdapter(_make_config(app_id="a", client_secret="b", **extra))
+
+    def test_format_includes_applicant_fields(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        text = QQAdapter._format_join_request({
+            "group_openid": "G1", "member_openid": "M1", "username": "小明",
+            "apply_source": "invited", "invited_by": "M0", "apply_at": "2026-10-03T12:00:00+08:00",
+            "verify_info": {"method": "verify_message", "verify_message": "放我进去"},
+            "join_request_id": "JR1"})
+        assert "小明" in text and "M1" in text and "放我进去" in text and "M0" in text
+
+    @pytest.mark.asyncio
+    async def test_notice_goes_to_operator_and_never_auto_approves(self):
+        adapter = self._make(allow_admin_from=["OP1"])
+        sent = []
+
+        async def fake_send(chat_id, content, **kw):
+            sent.append((chat_id, content))
+            return self._Ok()
+
+        adapter.send = fake_send
+        await adapter._on_group_join_request({
+            "group_openid": "G1", "member_openid": "M1", "username": "小明",
+            "apply_source": "self_apply", "join_request_id": "JR1"})
+        assert [chat for chat, _ in sent] == ["OP1"]
+        assert "入群申请" in sent[0][1]
+
+    @pytest.mark.asyncio
+    async def test_no_operator_target_is_a_silent_noop(self):
+        adapter = self._make()
+        called = []
+
+        async def fake_send(*args, **kw):
+            called.append(args)
+            return self._Ok()
+
+        adapter.send = fake_send
+        with mock.patch.dict(os.environ, {"QQ_ALLOWED_USERS": ""}, clear=False):
+            await adapter._on_group_join_request({"group_openid": "G1", "member_openid": "M1"})
+        assert called == []
+
+
+class TestProactiveSwitchEvents:
+    """C2C_MSG_REJECT / C2C_MSG_RECEIVE: log-only visibility for the proactive-message switch."""
+
+    def _make(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        return QQAdapter(_make_config(app_id="a", client_secret="b"))
+
+    def test_reject_logs_a_warning(self, caplog):
+        adapter = self._make()
+        with caplog.at_level(logging.WARNING):
+            adapter._dispatch_payload({"op": 0, "t": "C2C_MSG_REJECT", "s": 1, "d": {"openid": "U1"}})
+        assert any("proactive-message switch DISABLED" in r.getMessage() for r in caplog.records)
+
+    def test_receive_is_an_info_line(self, caplog):
+        adapter = self._make()
+        with caplog.at_level(logging.INFO):
+            adapter._dispatch_payload({"op": 0, "t": "C2C_MSG_RECEIVE", "s": 2, "d": {"openid": "U1"}})
+        assert any("proactive-message switch enabled" in r.getMessage() for r in caplog.records)
+
+
+class TestQuotedReply:
+    """message_reference: a reply quotes its triggering message (message_scene.ext msg_idx)."""
+
+    def _make(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        return QQAdapter(_make_config(app_id="a", client_secret="b"))
+
+    def test_extract_msg_idx(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        assert QQAdapter._extract_msg_idx(
+            {"message_scene": {"source": "default", "ext": ["auth_token=x", "msg_idx=REFIDX_ab=="]}}
+        ) == "REFIDX_ab=="
+        assert QQAdapter._extract_msg_idx({"message_scene": {"ext": ["ref_msg_idx=REFIDX_x=="]}}) == ""
+        assert QQAdapter._extract_msg_idx({"message_scene": "nope"}) == ""
+        assert QQAdapter._extract_msg_idx(None) == ""
+
+    @pytest.mark.asyncio
+    async def test_group_reply_carries_message_reference(self):
+        adapter = self._make()
+        adapter._remember_quote_ref("MID1", "REFIDX_1==")
+        cap = {}
+
+        async def fake_post(path, body):
+            cap["path"], cap["body"] = path, body
+            return SimpleNamespace(success=True, message_id="M1", error=None)
+
+        adapter._post_message = fake_post
+        await adapter._send_text_to("group", "G1", "hi", reply_to="MID1")
+        assert cap["body"]["msg_id"] == "MID1"
+        assert cap["body"]["message_reference"] == {"message_id": "REFIDX_1=="}
+
+    @pytest.mark.asyncio
+    async def test_c2c_reply_never_carries_reference(self):
+        """DMs are 1:1 — a quoted header is noise, and C2C stays on the plain path."""
+        adapter = self._make()
+        adapter._remember_quote_ref("MID1", "REFIDX_1==")
+        cap = {}
+
+        async def fake_post(path, body):
+            cap["path"], cap["body"] = path, body
+            return SimpleNamespace(success=True, message_id="M1", error=None)
+
+        adapter._post_message = fake_post
+        await adapter._send_text_to("c2c", "U1", "hi", reply_to="MID1")
+        assert cap["body"]["msg_id"] == "MID1"
+        assert "message_reference" not in cap["body"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_reply_target_gets_no_reference(self):
+        adapter = self._make()
+        cap = {}
+
+        async def fake_post(path, body):
+            cap["body"] = body
+            return SimpleNamespace(success=True, message_id="M1", error=None)
+
+        adapter._post_message = fake_post
+        await adapter._send_text_to("c2c", "U1", "hi", reply_to="MID_UNKNOWN")
+        assert "message_reference" not in cap["body"]
+
+    @pytest.mark.asyncio
+    async def test_proactive_send_is_never_quoted(self):
+        adapter = self._make()
+        adapter._remember_quote_ref("MID1", "REFIDX_1==")
+        cap = {}
+
+        async def fake_post(path, body):
+            cap["body"] = body
+            return SimpleNamespace(success=True, message_id="M1", error=None)
+
+        adapter._post_message = fake_post
+        await adapter._send_text_to("c2c", "U1", "notice")  # no reply_to → proactive
+        assert "message_reference" not in cap["body"]
+
+    def test_quote_refs_are_fifo_capped(self):
+        adapter = self._make()
+        adapter._quote_refs_max = 3
+        for i in range(5):
+            adapter._remember_quote_ref(f"M{i}", f"R{i}")
+        assert list(adapter._quote_refs) == ["M2", "M3", "M4"]
+
+
+class TestNativeStreaming:
+    """send_stream_frame: grow ONE QQ C2C message; hold short answers; never break sends."""
+
+    def _make(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        adapter = QQAdapter(_make_config(app_id="a", client_secret="b"))
+        adapter._last_msg_id["U1"] = "MID1"
+        adapter._chat_type_map["U1"] = "c2c"
+        adapter._chat_type_map["G1"] = "group"
+        calls = []
+
+        async def fake_api(method, path, body=None):
+            calls.append((method, path, dict(body or {})))
+            return {"id": "SID1", "timestamp": "", "ext_info": {}}
+
+        adapter._api_request = fake_api
+        return adapter, calls
+
+    def test_probe_is_c2c_only(self):
+        adapter, _ = self._make()
+        assert adapter.supports_native_streaming(chat_id="U1") is True
+        assert adapter.supports_native_streaming(chat_id="G1") is False
+
+    @pytest.mark.asyncio
+    async def test_empty_seed_is_swallowed(self):
+        adapter, calls = self._make()
+        assert await adapter.send_stream_frame("", chat_id="U1", turn_id="t1") is True
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_short_answer_never_opens_a_stream(self):
+        adapter, calls = self._make()
+        assert await adapter.send_stream_frame("短！", chat_id="U1", turn_id="t1") is True
+        # short final → False hands it to the normal send path (one ordinary message)
+        assert await adapter.send_stream_frame("短！", finalize=True, chat_id="U1", turn_id="t1") is False
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_long_answer_streams_keeping_msg_id_on_every_frame(self):
+        adapter, calls = self._make()
+        first = "长" * 300
+        assert await adapter.send_stream_frame(first, chat_id="U1", reply_to="MID1", turn_id="t1") is True
+        method, path, b0 = calls[0]
+        assert (method, path) == ("POST", "/v2/users/U1/stream_messages")
+        assert b0["msg_id"] == "MID1" and "stream_msg_id" not in b0
+        assert b0["index"] == 0 and b0["input_state"] == 1 and b0["content_type"] == "markdown"
+        assert await adapter.send_stream_frame(first + "加长", finalize=True, chat_id="U1",
+                                               reply_to="MID1", turn_id="t1") is True
+        b1 = calls[1][2]
+        assert b1["stream_msg_id"] == "SID1" and b1["index"] == 1 and b1["input_state"] == 10
+        assert b1["msg_id"] == "MID1", "every frame must keep the passive credential"
+
+    @pytest.mark.asyncio
+    async def test_group_is_never_streamed(self):
+        adapter, calls = self._make()
+        assert await adapter.send_stream_frame("长" * 300, chat_id="G1", turn_id="t1") is False
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_frame_error_returns_false_and_clears_state(self):
+        adapter, _ = self._make()
+
+        async def boom(method, path, body=None):
+            raise RuntimeError("QQ Bot API error [500] 系统繁忙")
+
+        adapter._api_request = boom
+        assert await adapter.send_stream_frame("长" * 300, chat_id="U1", turn_id="t1") is False
+        assert adapter._streams == {}
+
+    @pytest.mark.asyncio
+    async def test_stream_text_is_tag_neutralized(self):
+        adapter, calls = self._make()
+        body = "长" * 300 + ' 参考 <qqbot-at-user id="X" /> 这个标签'
+        assert await adapter.send_stream_frame(body, chat_id="U1", turn_id="t1") is True
+        assert "<qqbot-at-user" not in calls[0][2]["content_raw"]
+
+
+class TestGroupMembership:
+    """GROUP_ADD_ROBOT: greet the new group via event_id (no active-message permission)."""
+
+    def _make(self, **extra):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        adapter = QQAdapter(_make_config(app_id="a", client_secret="b", **extra))
+        calls = []
+
+        async def fake_api(method, path, body=None):
+            calls.append((method, path, dict(body or {})))
+            return {"id": "MID9"}
+
+        adapter._api_request = fake_api
+        return adapter, calls
+
+    @pytest.mark.asyncio
+    async def test_greets_allowlisted_group_with_event_id(self):
+        adapter, calls = self._make(group_policy="allowlist", group_allow_from=["G1"])
+        await adapter._on_group_membership("GROUP_ADD_ROBOT", {"group_openid": "G1"}, "EV1")
+        method, path, body = calls[0]
+        assert (method, path) == ("POST", "/v2/groups/G1/messages")
+        assert body["event_id"] == "EV1"           # passive reply → no active-message permission
+        assert body["msg_type"] == 0
+        assert "tamako" in body["content"]
+        assert "http" not in body["content"]       # 群消息不允许发 URL（40054010）
+
+    @pytest.mark.asyncio
+    async def test_non_allowlisted_group_stays_silent(self):
+        adapter, calls = self._make(group_policy="allowlist", group_allow_from=["G1"])
+        await adapter._on_group_membership("GROUP_ADD_ROBOT", {"group_openid": "G_OTHER"}, "EV1")
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_removal_only_logs(self):
+        adapter, calls = self._make(group_policy="allowlist", group_allow_from=["G1"])
+        await adapter._on_group_membership("GROUP_DEL_ROBOT", {"group_openid": "G1"}, "EV2")
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_missing_ids_skip_the_greeting(self):
+        adapter, calls = self._make(group_policy="open")
+        await adapter._on_group_membership("GROUP_ADD_ROBOT", {}, None)
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_greeting_failure_is_swallowed(self):
+        adapter, _ = self._make(group_policy="open")
+
+        async def boom(method, path, body=None):
+            raise RuntimeError("QQ Bot API error [400] 主动消息发送失败，无权限")
+
+        adapter._api_request = boom
+        await adapter._on_group_membership("GROUP_ADD_ROBOT", {"group_openid": "G1"}, "EV1")
+
+
+class TestGroupRecall:
+    """Admin-only 「撤回上一条」 in groups: the adapter deletes, the agent just narrates."""
+
+    ADMIN = "0123456789ABCDEF0123456789ABCDEF"
+    OTHER = "SOMEONE_ELSE_OPENID"
+
+    def _make(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        adapter = QQAdapter(_make_config(
+            app_id="a", client_secret="b", group_policy="allowlist", group_allow_from=["G1"],
+            group_allow_admin_from=[self.ADMIN]))
+        deletes = []
+
+        class Resp:
+            status_code = 200
+            text = ""
+
+        class Client:
+            async def request(self, method, url, headers=None, timeout=None):
+                deletes.append((method, url))
+                return Resp()
+
+        adapter._require_http_client = lambda: Client()
+
+        async def fake_headers():
+            return {}
+
+        adapter._auth_headers = fake_headers
+        return adapter, deletes
+
+    def test_trigger_patterns(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter as A
+        assert A._RECALL_PREV_RE.search("撤回上一条")
+        assert A._RECALL_PREV_RE.search("把刚才那条撤掉")
+        assert A._RECALL_OWN_RE.search("撤回你自己那条")
+        assert not A._RECALL_PREV_RE.search("今天天气不错")
+        assert not A._RECALL_OWN_RE.search("撤回上一条")
+
+    @pytest.mark.asyncio
+    async def test_prev_recall_targets_the_message_before_the_instruction(self):
+        adapter, deletes = self._make()
+        adapter._group_recent["G1"] = [("M0", "x"), ("M_SPAM", "spammer")]
+        note = await adapter._maybe_recall_from_text("G1", "撤回上一条", self.ADMIN, "M_INSTR")
+        from plugins.platforms.qqbot.constants import API_BASE
+        assert deletes == [("DELETE", f"{API_BASE}/v2/groups/G1/messages/M_SPAM")]
+        assert "已按前辈的话撤回" in note
+
+    @pytest.mark.asyncio
+    async def test_own_recall_uses_the_last_sent_id(self):
+        adapter, deletes = self._make()
+        adapter._last_sent_id["G1"] = "M_MINE"
+        note = await adapter._maybe_recall_from_text("G1", "撤回你自己那条", self.ADMIN, "M_INSTR")
+        assert deletes and deletes[0][1].endswith("/messages/M_MINE")
+        assert "我自己上一条" in note
+
+    @pytest.mark.asyncio
+    async def test_non_admin_cannot_trigger(self):
+        adapter, deletes = self._make()
+        adapter._group_recent["G1"] = [("M_SPAM", "spammer")]
+        assert await adapter._maybe_recall_from_text("G1", "撤回上一条", self.OTHER, "M_INSTR") == ""
+        assert deletes == []
+
+    @pytest.mark.asyncio
+    async def test_plain_chat_is_ignored(self):
+        adapter, deletes = self._make()
+        assert await adapter._maybe_recall_from_text("G1", "前辈今天忙吗", self.ADMIN, "M") == ""
+        assert deletes == []
+
+    @pytest.mark.asyncio
+    async def test_recall_failure_is_reported_in_the_note(self):
+        adapter, _ = self._make()
+        adapter._last_sent_id["G1"] = "M_MINE"
+
+        class Resp:
+            status_code = 400
+            text = '{"message":"已超出消息撤回时限","code":40064004}'
+
+        class Client:
+            async def request(self, method, url, headers=None, timeout=None):
+                return Resp()
+
+        adapter._require_http_client = lambda: Client()
+        note = await adapter._maybe_recall_from_text("G1", "撤回你自己那条", self.ADMIN, "M")
+        assert "失败" in note and "40064004" in note
+
+    @pytest.mark.asyncio
+    async def test_no_target_reports_honestly(self):
+        adapter, deletes = self._make()
+        note = await adapter._maybe_recall_from_text("G1", "撤回上一条", self.ADMIN, "M")
+        assert "没有可撤的消息 ID" in note
+        assert deletes == []
+
+
+class TestGroupMute:
+    """Admin-only 「把 XXX 禁言 30 分钟」/「解除 XXX 禁言」: adapter acts, agent narrates."""
+
+    ADMIN = "0123456789ABCDEF0123456789ABCDEF"
+    OTHER = "SOMEONE_ELSE_OPENID"
+
+    def _make(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        adapter = QQAdapter(_make_config(
+            app_id="a", client_secret="b", group_policy="allowlist", group_allow_from=["G1"],
+            group_allow_admin_from=[self.ADMIN]))
+        calls = []
+
+        class Resp:
+            status_code = 200
+            text = ""
+
+        class Client:
+            async def request(self, method, url, headers=None, json=None, timeout=None):
+                calls.append((method, url, json))
+                return Resp()
+
+        adapter._require_http_client = lambda: Client()
+
+        async def fake_headers():
+            return {}
+
+        adapter._auth_headers = fake_headers
+        adapter._group_recent["G1"] = [("M1", "SPAMMER_OPENID", "小广告")]
+        return adapter, calls
+
+    def test_duration_parsing(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter as A
+        assert A._parse_mute_seconds("把张三禁言 30 分钟") == 1800
+        assert A._parse_mute_seconds("禁言 2 小时") == 7200
+        assert A._parse_mute_seconds("禁言 1天") == 86400
+        assert A._parse_mute_seconds("把他禁言了") is None
+
+    @pytest.mark.asyncio
+    async def test_mutes_recent_speaker_by_nickname(self):
+        adapter, calls = self._make()
+        note = await adapter._maybe_mute_from_text("G1", "把 小广告 禁言 30 分钟", self.ADMIN, {})
+        method, url, body = calls[0]
+        from plugins.platforms.qqbot.constants import API_BASE
+        assert (method, url) == ("POST", f"{API_BASE}/v2/groups/G1/restrict_chat_setting")
+        member = body["members"][0]
+        assert member["op"] == "add" and member["member_openid"] == "SPAMMER_OPENID"
+        assert member["mute_expire_at"].endswith("+08:00")
+        assert "已按前辈的话把「小广告」禁言到" in note
+
+    @pytest.mark.asyncio
+    async def test_quoted_author_wins(self):
+        adapter, calls = self._make()
+        d = {"message_type": 103, "msg_elements": [{"author": {"member_openid": "QUOTED_OPENID"}}]}
+        await adapter._maybe_mute_from_text("G1", "把他禁言 10 分钟", self.ADMIN, d)
+        assert calls[0][2]["members"][0]["member_openid"] == "QUOTED_OPENID"
+
+    @pytest.mark.asyncio
+    async def test_missing_duration_asks_instead_of_muting(self):
+        adapter, calls = self._make()
+        note = await adapter._maybe_mute_from_text("G1", "把 小广告 禁言", self.ADMIN, {})
+        assert calls == [] and "多久" in note
+
+    @pytest.mark.asyncio
+    async def test_unknown_target_does_nothing(self):
+        adapter, calls = self._make()
+        note = await adapter._maybe_mute_from_text("G1", "把 陌生人 禁言 1 小时", self.ADMIN, {})
+        assert calls == [] and "没认出来是谁" in note
+
+    @pytest.mark.asyncio
+    async def test_unmute_uses_del_op(self):
+        adapter, calls = self._make()
+        note = await adapter._maybe_mute_from_text("G1", "解除 小广告 的禁言", self.ADMIN, {})
+        member = calls[0][2]["members"][0]
+        assert member["op"] == "del" and member["mute_expire_at"] == ""
+        assert "解除" in note
+
+    @pytest.mark.asyncio
+    async def test_non_admin_stays_out(self):
+        adapter, calls = self._make()
+        assert await adapter._maybe_mute_from_text("G1", "把 小广告 禁言 30 分钟", self.OTHER, {}) == ""
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_duration_over_30_days_is_clamped(self):
+        adapter, calls = self._make()
+        note = await adapter._maybe_mute_from_text("G1", "把 小广告 禁言 90 天", self.ADMIN, {})
+        assert "按 30 天算" in note
+
+    @pytest.mark.asyncio
+    async def test_at_mention_identifies_the_target(self):
+        adapter, calls = self._make()
+        d = {"mentions": [{"member_openid": "AT_OPENID", "username": "小广告"}]}
+        note = await adapter._maybe_mute_from_text("G1", "把 @小广告 禁言 15 分钟", self.ADMIN, d)
+        assert calls[0][2]["members"][0]["member_openid"] == "AT_OPENID"
+        assert "「小广告」" in note
+
+    @pytest.mark.asyncio
+    async def test_mention_beats_quote(self):
+        adapter, calls = self._make()
+        d = {"mentions": [{"member_openid": "AT_OPENID", "username": "谁"}],
+             "message_type": 103, "msg_elements": [{"author": {"member_openid": "QUOTED_OPENID"}}]}
+        await adapter._maybe_mute_from_text("G1", "禁言 5 分钟", self.ADMIN, d)
+        assert calls[0][2]["members"][0]["member_openid"] == "AT_OPENID"
+
+    @pytest.mark.asyncio
+    async def test_negated_instruction_does_nothing(self):
+        adapter, calls = self._make()
+        assert await adapter._maybe_mute_from_text("G1", "先别禁言 小广告", self.ADMIN, {}) == ""
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_mention_as_bare_name_falls_back_to_recent_speaker(self):
+        """If the platform hands us only a nickname, resolve it against recent speakers."""
+        adapter, calls = self._make()
+        await adapter._maybe_mute_from_text("G1", "把他禁言 5 分钟", self.ADMIN, {"mentions": ["小广告"]})
+        assert calls[0][2]["members"][0]["member_openid"] == "SPAMMER_OPENID"
+
+    @pytest.mark.asyncio
+    async def test_unusable_mention_is_asked_about_not_guessed(self):
+        adapter, calls = self._make()
+        note = await adapter._maybe_mute_from_text(
+            "G1", "禁言 5 分钟", self.ADMIN, {"mentions": [{"username": "陌生人"}]})
+        assert calls == [] and "没认出来是谁" in note
+
+
+class TestGroupMemberChange:
+    """GROUP_MEMBER_ADD/REMOVE (intent 1<<24): report to the operator, dedupe WS replays."""
+
+    def _make(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        adapter = QQAdapter(_make_config(
+            app_id="a", client_secret="b", group_policy="allowlist", group_allow_from=["G1"],
+            allow_admin_from=["OP1"]))
+        sent = []
+
+        async def fake_send(chat_id, content, **kw):
+            sent.append((chat_id, content))
+            return SimpleNamespace(success=True, message_id="M1", error=None)
+
+        adapter.send = fake_send
+        return adapter, sent
+
+    @pytest.mark.asyncio
+    async def test_new_member_is_reported_to_the_operator(self):
+        adapter, sent = self._make()
+        await adapter._on_group_member_change("GROUP_MEMBER_ADD", {
+            "group_openid": "G1", "member_openid": "NEW_MEMBER", "timestamp": 1784276757})
+        assert sent and sent[0][0] == "OP1"
+        assert "有人进群了" in sent[0][1] and "NEW_MEMBER" in sent[0][1]
+
+    @pytest.mark.asyncio
+    async def test_replay_is_deduped(self):
+        adapter, sent = self._make()
+        event = {"group_openid": "G1", "member_openid": "NEW_MEMBER", "timestamp": 1784276757}
+        await adapter._on_group_member_change("GROUP_MEMBER_ADD", event)
+        await adapter._on_group_member_change("GROUP_MEMBER_ADD", dict(event))
+        assert len(sent) == 1
+
+    @pytest.mark.asyncio
+    async def test_non_allowlisted_group_is_silent(self):
+        adapter, sent = self._make()
+        await adapter._on_group_member_change("GROUP_MEMBER_ADD", {
+            "group_openid": "G_OTHER", "member_openid": "X", "timestamp": 1})
+        assert sent == []
+
+    @pytest.mark.asyncio
+    async def test_leaving_is_reported_too(self):
+        adapter, sent = self._make()
+        await adapter._on_group_member_change("GROUP_MEMBER_REMOVE", {
+            "group_openid": "G1", "member_openid": "X", "timestamp": 1})
+        assert sent and "退群了" in sent[0][1]
+
+    @pytest.mark.asyncio
+    async def test_missing_fields_are_ignored(self):
+        adapter, sent = self._make()
+        await adapter._on_group_member_change("GROUP_MEMBER_ADD", {"group_openid": "G1"})
+        assert sent == []
+
+
+class TestRelationAndGroupSwitchEvents:
+    """FRIEND_ADD/DEL + GROUP_MSG_REJECT/RECEIVE all live on 1<<25 (already subscribed)."""
+
+    def _make(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        adapter = QQAdapter(_make_config(
+            app_id="a", client_secret="b", group_policy="allowlist", group_allow_from=["G1"],
+            allow_admin_from=["OP1"]))
+        sent = []
+
+        async def fake_send(chat_id, content, **kw):
+            sent.append((chat_id, content))
+            return SimpleNamespace(success=True, message_id="M1", error=None)
+
+        adapter.send = fake_send
+        return adapter, sent
+
+    @pytest.mark.asyncio
+    async def test_friend_add_notifies_operator(self):
+        adapter, sent = self._make()
+        await adapter._on_friend_change("FRIEND_ADD", {"openid": "SOMEONE", "timestamp": 1784276757})
+        assert sent and "添加了 tamako" in sent[0][1] and "SOMEONE" in sent[0][1]
+
+    @pytest.mark.asyncio
+    async def test_friend_remove_notifies_operator(self):
+        adapter, sent = self._make()
+        await adapter._on_friend_change("FRIEND_DEL", {"openid": "SOMEONE", "timestamp": 2})
+        assert sent and "删掉了 tamako" in sent[0][1]
+
+    @pytest.mark.asyncio
+    async def test_friend_replay_is_deduped(self):
+        adapter, sent = self._make()
+        event = {"openid": "SOMEONE", "timestamp": 1}
+        await adapter._on_friend_change("FRIEND_ADD", event)
+        await adapter._on_friend_change("FRIEND_ADD", dict(event))
+        assert len(sent) == 1
+
+    def test_group_switch_events_are_logged_not_sent(self, caplog):
+        import logging as _logging
+        adapter, sent = self._make()
+        with caplog.at_level(_logging.WARNING, logger="plugins.platforms.qqbot.adapter"):
+            adapter._dispatch_payload({"op": 0, "s": 1, "t": "GROUP_MSG_REJECT",
+                                       "d": {"group_openid": "G1"}})
+            adapter._dispatch_payload({"op": 0, "s": 2, "t": "GROUP_MSG_RECEIVE",
+                                       "d": {"group_openid": "G1"}})
+        assert "DISABLED" in caplog.text and sent == []
+
+
+class TestApiErrorSurfacing:
+    """判失败只看 err_code（不信 message）；2xx 也可能带回 error body；trace_id 要留下。"""
+
+    def _adapter_with_response(self, status, body, *, raises=False):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        adapter = QQAdapter(_make_config(app_id="a", client_secret="b"))
+
+        class Resp:
+            status_code = status
+            text = str(body)
+
+            def json(self):
+                if raises:
+                    raise ValueError("not json")
+                return body
+
+        class Client:
+            async def request(self, *a, **kw):
+                return Resp()
+
+        adapter._require_http_client = lambda: Client()
+
+        async def fake_headers():
+            return {}
+
+        adapter._auth_headers = fake_headers
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_error_text_carries_err_code_and_trace_id(self):
+        adapter = self._adapter_with_response(
+            400, {"err_code": 40034005, "message": "回复消息msg_id已过期", "trace_id": "abc123"})
+        with pytest.raises(RuntimeError) as exc:
+            await adapter._api_request("POST", "/v2/users/U/messages", {})
+        text = str(exc.value)
+        assert "40034005" in text and "abc123" in text and "[400]" in text
+
+    @pytest.mark.asyncio
+    async def test_two_hundred_with_error_body_is_a_failure(self):
+        adapter = self._adapter_with_response(200, {"err_code": 304025, "message": "消息被打击"})
+        with pytest.raises(RuntimeError) as exc:
+            await adapter._api_request("POST", "/v2/users/U/messages", {})
+        assert "304025" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_async_accepted_audit_is_not_raised(self):
+        adapter = self._adapter_with_response(
+            202, {"err_code": 304024, "message": "回复消息异步调用成功，等待人工审核"})
+        data = await adapter._api_request("POST", "/v2/groups/G/messages", {})
+        assert data["err_code"] == 304024
+
+    @pytest.mark.asyncio
+    async def test_plain_success_returns_the_body(self):
+        adapter = self._adapter_with_response(200, {"id": "M1"})
+        assert (await adapter._api_request("POST", "/v2/users/U/messages", {}))["id"] == "M1"
+
+    @pytest.mark.asyncio
+    async def test_unparseable_body_on_success_is_tolerated(self):
+        adapter = self._adapter_with_response(200, None, raises=True)
+        assert await adapter._api_request("GET", "/v2/whatever") == {}
+
+
+class TestGroupDropIsVisible:
+    """A group message blocked by the allowlist must leave a trace — otherwise 'nothing happened'
+    is indistinguishable from 'the platform never pushed it'."""
+
+    @pytest.mark.asyncio
+    async def test_dropped_inbound_is_logged(self, caplog):
+        import logging as _logging
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        adapter = QQAdapter(_make_config(
+            app_id="a", client_secret="b", group_policy="allowlist", group_allow_from=["G1"]))
+        with caplog.at_level(_logging.INFO, logger="plugins.platforms.qqbot.adapter"):
+            await adapter._on_message("GROUP_AT_MESSAGE_CREATE", {
+                "group_openid": "G_OTHER", "id": "M1", "content": "hi",
+                "author": {"member_openid": "MEMBER1"},
+                "timestamp": "2026-10-03T15:00:00+08:00"})
+        assert "dropped by allowlist" in caplog.text
+
+
+class TestGroupContentPassthrough:
+    """GROUP_AT_MESSAGE_CREATE content arrives without the @bot prefix — do not re-strip it."""
+
+    @pytest.mark.asyncio
+    async def test_leading_mention_of_another_member_survives(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        adapter = QQAdapter(_make_config(
+            app_id="a", client_secret="b", group_policy="allowlist", group_allow_from=["G1"]))
+        seen = {}
+
+        async def fake_ingest(d, msg_id, content, attachments, timestamp, **kw):
+            seen["content"] = content
+
+        adapter._ingest = fake_ingest
+        await adapter._handle_group_message(
+            {"group_openid": "G1"}, "M1", "@Alice 你看这个", {"member_openid": "X"}, "")
+        assert seen["content"] == "@Alice 你看这个"
+
+
+class TestArkCard:
+    """message_type=3 cards: only ADD the fields QQ's own content did not already render."""
+
+    CARD = {"message_type": 3, "ark_data": {
+        "ark_type": "miniapp", "ark_name": "小程序", "prompt": "[每日打卡]快来完成今日学习打卡",
+        "fields": {"title": "快来完成今日学习打卡", "desc": "连续打卡 7 天",
+                   "source": "学习助手", "tag": "微信小程序",
+                   "jump_url": "https://example.com/jump"}}}
+
+    def test_renders_fields_when_content_has_none(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter as A
+        out = A._render_ark_card(self.CARD)
+        assert "小程序" in out and "链接: https://example.com/jump" in out and "来源: 学习助手" in out
+
+    def test_skips_fields_the_platform_already_rendered(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter as A
+        already = "title: 快来完成今日学习打卡\nsource: 学习助手"
+        out = A._render_ark_card(self.CARD, already=already)
+        assert "标题:" not in out and "来源:" not in out
+        assert "链接: https://example.com/jump" in out
+
+    def test_nothing_new_returns_empty(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter as A
+        card = {"ark_data": {"ark_name": "小程序", "fields": {"title": "X"}}}
+        assert A._render_ark_card(card, already="title: X") == ""
+        assert A._render_ark_card({"content": "普通消息"}) == ""
+        assert A._render_ark_card(None) == ""
+        assert A._render_ark_card({"ark_data": "nope"}) == ""
+
+    def test_truncated_content_gets_the_full_value_back(self):
+        """A card whose desc the platform cut short (QQ 收藏 notes) should be completed."""
+        from plugins.platforms.qqbot.adapter import QQAdapter as A
+        full = "bindPort = 7000\nserverAddr = \"127.0.0.1\"\n" * 3
+        card = {"ark_data": {"ark_name": "图文H5", "fields": {"desc": full}}}
+        out = A._render_ark_card(card, already="desc: " + full[:40] + "…")
+        assert "描述: " in out and "serverAddr" in out
+
+    def test_long_values_are_capped(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter as A
+        card = {"ark_data": {"ark_name": "图文H5", "fields": {"desc": "x" * 5000}}}
+        out = A._render_ark_card(card)
+        assert "…（原值更长）" in out and len(out) < 900
 
 
 # ---------------------------------------------------------------------------
@@ -1253,4 +2006,139 @@ class TestReadEventsClosedWsGuard:
         adapter._ws = SimpleNamespace(closed=True)
         with pytest.raises(RuntimeError):
             asyncio.run(adapter._read_events())
+
+
+# ---------------------------------------------------------------------------
+# [tamako-local] toolsets_for_source — group/guild chats get a hardened toolset
+# ---------------------------------------------------------------------------
+
+
+class TestQQAdapterGroupToolsets:
+    """A group keeps chat + web + media + ``terminal``; the per-source sandbox policy
+    (``terminal.source_policy``) moves a group turn's execution into the docker sandbox,
+    so no host-only toolset (file / code_execution / memory / …) is ever handed out."""
+
+    _HOST_ONLY_TOOLSETS = {"file", "code_execution", "computer_use",
+                           "memory", "session_search", "browser"}
+
+    def _make_adapter(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        return QQAdapter(_make_config(app_id="a", client_secret="b"))
+
+    def test_group_and_guild_get_allowlist(self):
+        from plugins.platforms.qqbot.adapter import _GROUP_ALLOWED_TOOLSETS
+        adapter = self._make_adapter()
+        for chat_type in ("group", "guild", "GROUP"):
+            got = adapter.toolsets_for_source(SimpleNamespace(chat_type=chat_type))
+            assert got == list(_GROUP_ALLOWED_TOOLSETS)
+
+    def test_dm_c2c_and_unknown_keep_platform_default(self):
+        adapter = self._make_adapter()
+        for chat_type in ("dm", "c2c", "", None):
+            assert adapter.toolsets_for_source(SimpleNamespace(chat_type=chat_type)) is None
+
+    def test_group_result_keeps_terminal_but_no_host_only_toolsets(self):
+        """``terminal`` is allowed back into groups (2026-10-09, "堵不如疏") BECAUSE the
+        group turn's execution is moved into the docker sandbox per source
+        (``terminal.source_policy``); every host-only toolset stays out.
+
+        ``relay`` (2026-10-10) is likewise allowed: ``relay_to_owner`` takes no target,
+        sends only to the owner fixed in config, and runs in the gateway — the one
+        outward-send toolset a group may have, and not a host-only one."""
+        adapter = self._make_adapter()
+        got = set(adapter.toolsets_for_source(SimpleNamespace(chat_type="group")) or [])
+        assert "terminal" in got
+        assert "relay" in got
+        assert not (got & self._HOST_ONLY_TOOLSETS)
+
+    def test_fail_closed_when_source_cannot_be_classified(self):
+        """SOUL §6.5 fails CLOSED: a source whose chat_type raises still gets
+        the group-safe set instead of falling back to the platform default."""
+        from plugins.platforms.qqbot.adapter import _GROUP_ALLOWED_TOOLSETS
+
+        class ExplodingSource:
+            @property
+            def chat_type(self):
+                raise RuntimeError("boom")
+
+        adapter = self._make_adapter()
+        assert adapter.toolsets_for_source(ExplodingSource()) == list(_GROUP_ALLOWED_TOOLSETS)
+
+
+class TestQQAdapterTrustedDmToolsets:
+    """[tamako-local] A HOST-TRUSTED sender's DM drops the sandbox-era ``relay`` toolset only.
+
+    The trusted DM runs on the host, where ``terminal`` already reaches the send/file
+    machinery, so ``relay_to_owner``/``export_file`` are redundant there. Everything else
+    (browser, memory, MCP, …) stays exactly as the normal DM list has it.
+    """
+
+    def _make_adapter(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        return QQAdapter(_make_config(app_id="a", client_secret="b"))
+
+    def test_trusted_dm_drops_only_relay(self, monkeypatch):
+        import plugins.platforms.qqbot.adapter as qq_adapter
+        monkeypatch.setattr(qq_adapter, "_configured_qqbot_toolsets",
+                            lambda: ["terminal", "file", "relay", "web", "memory"])
+        monkeypatch.setattr("tools.terminal_scope.trusted_sender", lambda src: True)
+        got = self._make_adapter().toolsets_for_source(
+            SimpleNamespace(chat_type="dm", platform="qqbot", user_id="x"))
+        assert got == ["terminal", "file", "web", "memory"]
+
+    def test_untrusted_dm_keeps_the_platform_default(self, monkeypatch):
+        monkeypatch.setattr("tools.terminal_scope.trusted_sender", lambda src: False)
+        assert self._make_adapter().toolsets_for_source(SimpleNamespace(chat_type="dm")) is None
+
+    def test_trusted_group_still_gets_the_group_allowlist(self, monkeypatch):
+        from plugins.platforms.qqbot.adapter import _GROUP_ALLOWED_TOOLSETS
+        monkeypatch.setattr("tools.terminal_scope.trusted_sender", lambda src: True)
+        assert self._make_adapter().toolsets_for_source(
+            SimpleNamespace(chat_type="group")) == list(_GROUP_ALLOWED_TOOLSETS)
+
+
+class TestQQAdapterOwnerDmToolsets:
+    """[tamako-local] The OPERATOR's own DM additionally gets ``cronjob``.
+
+    The 传话待回 watcher is scheduled from the owner's QQ DM, and that DM's ``terminal``
+    is the sandboxed one, so ``cronjob`` is the only tool that can schedule there.
+    Deliberately scoped to owner ids (``terminal.source_policy.owner_ids``): adding the
+    toolset to ``platform_toolsets.qqbot`` would hand it to every paired friend's DM, and
+    a cron job runs as a source-less, host-privileged session — a sandbox escape.
+    """
+
+    def _make_adapter(self):
+        from plugins.platforms.qqbot.adapter import QQAdapter
+        return QQAdapter(_make_config(app_id="a", client_secret="b"))
+
+    def test_owner_dm_adds_cronjob_after_the_platform_list(self, monkeypatch):
+        import plugins.platforms.qqbot.adapter as qq_adapter
+        monkeypatch.setattr(qq_adapter, "_configured_qqbot_toolsets",
+                            lambda: ["terminal", "file", "relay", "web", "memory"])
+        monkeypatch.setattr("tools.terminal_scope.trusted_sender", lambda src: False)
+        monkeypatch.setattr("tools.terminal_scope.owner_sender", lambda src: True)
+        got = self._make_adapter().toolsets_for_source(
+            SimpleNamespace(chat_type="dm", platform="qqbot", user_id="owner"))
+        assert got == ["terminal", "file", "relay", "web", "memory", "cronjob"]
+
+    def test_owner_dm_with_cronjob_already_listed_keeps_platform_default(self, monkeypatch):
+        import plugins.platforms.qqbot.adapter as qq_adapter
+        monkeypatch.setattr(qq_adapter, "_configured_qqbot_toolsets",
+                            lambda: ["terminal", "cronjob"])
+        monkeypatch.setattr("tools.terminal_scope.trusted_sender", lambda src: False)
+        monkeypatch.setattr("tools.terminal_scope.owner_sender", lambda src: True)
+        assert self._make_adapter().toolsets_for_source(
+            SimpleNamespace(chat_type="dm", platform="qqbot", user_id="owner")) is None
+
+    def test_non_owner_dm_never_gets_cronjob(self, monkeypatch):
+        monkeypatch.setattr("tools.terminal_scope.trusted_sender", lambda src: False)
+        monkeypatch.setattr("tools.terminal_scope.owner_sender", lambda src: False)
+        assert self._make_adapter().toolsets_for_source(
+            SimpleNamespace(chat_type="dm", platform="qqbot", user_id="friend")) is None
+
+    def test_owner_group_still_gets_the_group_allowlist(self, monkeypatch):
+        from plugins.platforms.qqbot.adapter import _GROUP_ALLOWED_TOOLSETS
+        monkeypatch.setattr("tools.terminal_scope.owner_sender", lambda src: True)
+        assert self._make_adapter().toolsets_for_source(
+            SimpleNamespace(chat_type="group")) == list(_GROUP_ALLOWED_TOOLSETS)
 
