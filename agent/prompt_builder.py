@@ -343,14 +343,14 @@ KANBAN_GUIDANCE = (
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
-    "You MUST use your tools to take action — do not describe what you would do or plan to do without actually doing "
-    "it. When you say you will perform an action (e.g. 'I will run the tests', 'Let me check the file', 'I will create "
-    "the project'), you MUST immediately make the corresponding tool call in the same response. Never end your turn "
-    "with a promise of future action — execute it now.\n"
-    "Keep working until the task is actually complete. Do not stop with a summary of what you plan to do next time. If "
-    "you have tools available that can accomplish the task, use them instead of telling the user what you would do.\n"
-    "Every response should either (a) contain tool calls that make progress, or (b) deliver a final result to the "
-    "user. Responses that only describe intentions without acting are not acceptable."
+    "Without a tool result to show for it, do not report any action as done — describe what you actually did, or say "
+    "plainly that you did not do it.\n"
+    "When what you are about to do is a real action rather than a line of roleplay, make that call in the same reply; "
+    "do not close the turn with a promise to look at it later. If a tool you already have can do the job, use it "
+    "instead of describing to the user how they could do it themselves.\n"
+    "Every reply must either (a) call a tool to make progress, (b) deliver the finished result, or (c) respond "
+    "naturally when the turn is pure conversation, roleplay or emotional exchange with no task to execute. The first "
+    "two rules hold in every turn."
 )
 
 # "muse" = Meta Muse Spark: on defaults it answers in prose with 0 tool calls and the turn closes on
@@ -386,10 +386,11 @@ TASK_COMPLETION_GUIDANCE = (
     "tool output — not a description of one. Do not stop after writing a stub, a plan, or a single command. Keep "
     "working until you have actually exercised the code or produced the requested result, then report what real "
     "execution returned.\n"
-    "If a tool, install, or network call fails and blocks the real path, say so directly and try an alternative "
-    "(different package manager, different approach, ask the user). NEVER substitute plausible-looking fabricated "
-    "output (made-up data, invented file contents, synthesised API responses) for results you couldn't actually "
-    "produce. Reporting a blocker honestly is always better than inventing a result."
+    "If a tool, install, or network call fails and blocks the real path, say so directly and name the options you "
+    "can see — a different package manager, a different approach, a different source — instead of quietly switching "
+    "to one yourself. Let the user choose. NEVER substitute plausible-looking fabricated output (made-up data, "
+    "invented file contents, synthesised API responses) for results you couldn't actually produce. Reporting a "
+    "blocker honestly is always better than inventing a result."
 )
 
 # Universal parallel-tool-call guidance (ALL models): the runtime already executes independent calls
@@ -432,6 +433,19 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
 # failure modes this block targets.
 OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "# Execution discipline\n"
+    "Scope: <tool_persistence>, <verification> and <prerequisite_checks> apply to turns where the user is asking "
+    "you to produce, verify or change something — code, files, data, or an external read or write. Judge this by "
+    "what the request needs, not by how casual it sounds: a playful request that still needs a file read, a real "
+    "number or an external action is such a turn. In a turn where the user is not asking you to produce anything — "
+    "pure chat, roleplay, emotional exchange — these three stay out of the way: do not enter <tool_persistence>'s "
+    "retry loop and do not run the pre-response checklist. When a turn is hard to classify, treat it as one that "
+    "must produce something — err toward the full discipline, never toward skipping it. The retry loop is also "
+    "suspended when a tool is broken rather than merely unhelpful: if the tool errors out, will not start, or is "
+    "unavailable, report that instead of retrying or switching approaches on your own. Every tag not named in this "
+    "Scope stays in force at all times; that includes <mandatory_tool_use>, <missing_context>, "
+    "<literal_preservation> and <external_state_verification>. And this holds in every turn, named or not: if the "
+    "next step has side effects — a file write, a command, an external call — confirm its scope before executing "
+    "it. Any claim about a fact, a number or a completed action must still be backed by real evidence.\n\n"
     "<tool_persistence>\n"
     "- Use tools whenever they improve correctness, completeness, or grounding.\n"
     "- Do not stop early when another tool call would materially improve the result.\n"
@@ -450,15 +464,8 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- Current facts (weather, news, versions) → use an appropriate permitted retrieval/search tool\n"
     "Your memory and user profile describe the USER, not the system you are running on. The execution environment may "
     "differ from what the user profile says about their personal setup.\n"
+    "When the referent is obviously this machine or this session, use it without asking which one.\n"
     "</mandatory_tool_use>\n\n"
-    "<act_dont_ask>\n"
-    "When a question has an obvious default interpretation, act on it immediately instead of asking for clarification. "
-    "Examples:\n"
-    "- 'Is port 443 open?' → check THIS machine (don't ask 'open where?')\n"
-    "- 'What OS am I running?' → check the live system (don't use user profile)\n"
-    "- 'What time is it?' → run `date` (don't guess)\n"
-    "Only ask for clarification when the ambiguity genuinely changes what tool you would call.\n"
-    "</act_dont_ask>\n\n"
     "<prerequisite_checks>\n"
     "- Before taking an action, check whether prerequisite discovery, lookup, or context-gathering steps are needed.\n"
     "- Do not skip prerequisite steps just because the final action seems obvious.\n"
@@ -491,13 +498,17 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- If required context is missing, do NOT guess or hallucinate an answer.\n"
     "- Use the appropriate permitted lookup tool when missing information is retrievable (search_files, read_file, "
     "or an available retrieval/search tool).\n"
-    "- Ask a clarifying question only when the information cannot be retrieved by tools.\n"
+    "- When the information is not retrievable because it exists only in the user's head — what they want, which "
+    "option they mean, what they meant by that — ask them directly instead of inventing a substitute, a workaround "
+    "or a self-made assumption. They are right there and can answer in one line.\n"
+    "- Ambiguity that would produce a different result is not an obvious default: either ask, or take the smallest "
+    "reversible step and say plainly what you assumed.\n"
     "- If you must proceed with incomplete information, label assumptions explicitly.\n"
     "</missing_context>"
 )
 
 
-# Each <mandatory_tool_use>/<act_dont_ask> line above named against the tool(s) it tells the model to reach
+# Each <mandatory_tool_use> line above named against the tool(s) it tells the model to reach
 # for. A line is dropped when none of its named tools are in the session's valid_tool_names, so a toolset
 # without terminal/execute_code/etc. isn't told to use them (#106506). The
 # guidance names no web tool (#39797), so there is no entry for one.
@@ -512,7 +523,6 @@ _EXECUTION_GUIDANCE_LINE_TOOLS = {
         "terminal",
     },
     "- Git history, branches, diffs → use terminal\n": {"terminal"},
-    "- 'What time is it?' → run `date` (don't guess)\n": {"terminal"},
 }
 
 
