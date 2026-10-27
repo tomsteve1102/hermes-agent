@@ -67,11 +67,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          bash scripts/run_tests.sh \
-            tests/hermes_cli/test_venv_holder_windows_live.py \
-            tests/hermes_cli/test_taskkill_identity_windows_live.py \
-            tests/hermes_cli/test_git_trampoline_windows_live.py \
-            tests/pm/test_held_entry_windows_live.py
+          bash scripts/run_tests.sh tests/hermes_cli/test_desktop_release_holder_windows_live.py
 
       - name: Run Telegram CLOSE-WAIT reconnect live E2E (#87057)
         shell: bash
