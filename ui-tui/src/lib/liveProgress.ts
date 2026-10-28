@@ -38,41 +38,32 @@ const isBarrierMessage = (msg: Msg | undefined) => {
   return false
 }
 
-const isToolCarryingTrail = (msg: Msg | undefined) => Boolean(msg?.kind === 'trail' && !msg.text && msg.tools?.length)
-
+// A tool shelf belongs to the *nearest* holder above it — never to an earlier one.
+//
+// The holder is the closest trail row that can carry tools: the reasoning segment that just
+// closed (a trail with `thinking`), or an adjacent tool shelf. Skipping past a reasoning row to
+// reach an older tool-carrying shelf made a whole turn's tools pile up under the FIRST thinking
+// block, leaving the later thinking blocks empty — the order on screen stopped matching the order
+// the model actually worked in (reason → tool → reason → tool).
 export const appendToolShelfMessage = (prev: readonly Msg[], msg: Msg): Msg[] => {
   if (!isToolShelfMessage(msg)) {
     return [...prev, msg]
   }
 
-  let fallbackHolder: number | null = null
-
   for (let index = prev.length - 1; index >= 0; index--) {
     const candidate = prev[index]
 
-    if (isToolCarryingTrail(candidate)) {
+    if (isBarrierMessage(candidate)) {
+      break
+    }
+
+    if (canHoldToolShelf(candidate)) {
       const next = [...prev]
 
       next[index] = mergeToolShelfInto(candidate!, msg)
 
       return next
     }
-
-    if (fallbackHolder === null && canHoldToolShelf(candidate)) {
-      fallbackHolder = index
-    }
-
-    if (isBarrierMessage(candidate)) {
-      break
-    }
-  }
-
-  if (fallbackHolder !== null) {
-    const next = [...prev]
-
-    next[fallbackHolder] = mergeToolShelfInto(prev[fallbackHolder]!, msg)
-
-    return next
   }
 
   return [...prev, msg]

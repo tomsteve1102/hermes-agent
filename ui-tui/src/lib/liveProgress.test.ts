@@ -47,7 +47,7 @@ describe('appendToolShelfMessage', () => {
     expect(merged).toEqual([{ kind: 'trail', role: 'system', text: '', thinking: 'plan', tools: ['one ✓', 'two ✓'] }])
   })
 
-  it('merges through intervening thinking-only rows back into the nearest holder', () => {
+  it('attaches to the nearest holder, never to an earlier one', () => {
     const prev: Msg[] = [
       { kind: 'trail', role: 'system', text: '', thinking: 'plan', tools: ['one ✓'] },
       { kind: 'trail', role: 'system', text: '', thinking: 'more plan' }
@@ -66,12 +66,18 @@ describe('appendToolShelfMessage', () => {
       role: 'system',
       text: '',
       thinking: 'plan',
-      tools: ['one ✓', 'two ✓']
+      tools: ['one ✓']
     })
-    expect(merged[1]).toEqual({ kind: 'trail', role: 'system', text: '', thinking: 'more plan' })
+    expect(merged[1]).toEqual({
+      kind: 'trail',
+      role: 'system',
+      text: '',
+      thinking: 'more plan',
+      tools: ['two ✓']
+    })
   })
 
-  it('collapses a chronological thinking/tool/thinking/tool stream into one shelf', () => {
+  it('keeps each reasoning step with the tools it produced, in order', () => {
     const events: Msg[] = [
       { kind: 'trail', role: 'system', text: '', thinking: 'plan' },
       { kind: 'trail', role: 'system', text: '', tools: ['one ✓'] },
@@ -82,15 +88,41 @@ describe('appendToolShelfMessage', () => {
 
     const reduced = events.reduce<Msg[]>((acc, msg) => appendToolShelfMessage(acc, msg), [])
 
+    // Two steps, two blocks: the later tools never migrate up into the first thinking block.
     expect(reduced).toHaveLength(2)
     expect(reduced[0]).toEqual({
       kind: 'trail',
       role: 'system',
       text: '',
       thinking: 'plan',
-      tools: ['one ✓', 'two ✓', 'three ✓']
+      tools: ['one ✓']
     })
-    expect(reduced[1]).toEqual({ kind: 'trail', role: 'system', text: '', thinking: 'more plan' })
+    expect(reduced[1]).toEqual({
+      kind: 'trail',
+      role: 'system',
+      text: '',
+      thinking: 'more plan',
+      tools: ['two ✓', 'three ✓']
+    })
+  })
+
+  it('gives every reason → tool step its own block across a long turn', () => {
+    const events: Msg[] = [
+      { kind: 'trail', role: 'system', text: '', thinking: 'step 1' },
+      { kind: 'trail', role: 'system', text: '', tools: ['read ✓'] },
+      { kind: 'trail', role: 'system', text: '', thinking: 'step 2' },
+      { kind: 'trail', role: 'system', text: '', tools: ['skill ✓'] },
+      { kind: 'trail', role: 'system', text: '', thinking: 'step 3' },
+      { kind: 'trail', role: 'system', text: '', tools: ['patch ✓'] }
+    ]
+
+    const reduced = events.reduce<Msg[]>((acc, msg) => appendToolShelfMessage(acc, msg), [])
+
+    expect(reduced.map(msg => [msg.thinking, msg.tools])).toEqual([
+      ['step 1', ['read ✓']],
+      ['step 2', ['skill ✓']],
+      ['step 3', ['patch ✓']]
+    ])
   })
 
   it('starts a new shelf across assistant text boundaries', () => {
