@@ -2928,7 +2928,16 @@ def _try_custom_endpoint() -> tuple[Optional[Any], Optional[str]]:
             return _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra), model
         return AnthropicAuxiliaryClient(real_client, model, custom_key, custom_base,
                                         is_oauth=anthropic_route_is_oauth(custom_base, custom_key)), model
-    # URL-based anthropic detection for custom endpoints without explicit api_mode.
+    # URL-based native Gemini / Anthropic detection for custom endpoints without explicit api_mode.
+    from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
+    if is_native_gemini_base_url(custom_base):
+        from agent.opencode_affinity import merge_session_affinity_headers
+        _merged = merge_session_affinity_headers(
+            {"extra_headers": dict(_custom_headers or {})}, "custom", custom_base,
+            _runtime_main_value("session_id") or None,
+        )
+        _hdr_kw = {"default_headers": _merged["extra_headers"]} if _merged.get("extra_headers") else {}
+        return GeminiNativeClient(api_key=custom_key, base_url=custom_base, **_hdr_kw), model
     _fallback_client = _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra)
     return _maybe_wrap_anthropic(_fallback_client, model, custom_key, custom_base, custom_mode), model
 
@@ -4928,6 +4937,16 @@ def _wrap_transport(req: _ResolveRequest, client_obj: Any, final_model_str: str,
     _oc_mode, _oc_base = opencode_transport(req.provider, final_model_str, base_url_str)
     if _oc_mode:
         req, base_url_str = req._replace(api_mode=_oc_mode), _oc_base
+    from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
+    if base_url_str and is_native_gemini_base_url(base_url_str) and not isinstance(client_obj, GeminiNativeClient):
+        from agent.opencode_affinity import merge_session_affinity_headers
+        _existing_hdrs = dict(getattr(client_obj, "_custom_headers", None) or {})
+        _merged = merge_session_affinity_headers(
+            {"extra_headers": _existing_hdrs}, req.provider or "", base_url_str,
+            _runtime_main_value("session_id") or None,
+        )
+        _hdr_kw = {"default_headers": _merged["extra_headers"]} if _merged.get("extra_headers") else {}
+        return GeminiNativeClient(api_key=api_key_str, base_url=base_url_str, **_hdr_kw)
     needs_codex = not (
         isinstance(client_obj, CodexAuxiliaryClient) or req.raw_codex
     ) and (

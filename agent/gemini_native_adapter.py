@@ -923,7 +923,7 @@ class GeminiNativeClient:
         self, *, model: str = "gemini-3.7-flash", messages: Optional[list[dict[str, Any]]] = None, stream: bool = False,
         tools: Any = None, tool_choice: Any = None, temperature: Optional[float] = None, max_tokens: Optional[int] = None,
         top_p: Optional[float] = None, stop: Any = None, response_format: Any = None, extra_body: Optional[dict[str, Any]] = None,
-        timeout: Any = None, **_: Any,
+        extra_headers: Optional[dict[str, Any]] = None, timeout: Any = None, **_: Any,
     ) -> Any:
         extra = extra_body if isinstance(extra_body, dict) else {}
         # Long-decode budget (Gemini 4, effort above high) raises the total cap; an explicit larger cap still wins.
@@ -938,18 +938,20 @@ class GeminiNativeClient:
         )
         model = bare_gemini_model_id(model)
         url = f"{self.base_url}/models/{model}:"
+        req_headers = {str(k): str(v) for k, v in extra_headers.items() if v is not None} if isinstance(extra_headers, dict) else None
         if stream:
-            return self._stream_completion(model, f"{url}{self.STREAM_METHOD}?alt=sse", request, timeout)
-        hops = [self._generate(url + self.GENERATE_METHOD, request, timeout)]
+            return self._stream_completion(model, f"{url}{self.STREAM_METHOD}?alt=sse", request, timeout, extra_headers=req_headers)
+        hops = [self._generate(url + self.GENERATE_METHOD, request, timeout, extra_headers=req_headers)]
         max_hops = long_decode_hops(request["generationConfig"].get("maxOutputTokens")) + 1
         # Long decode: same request + token, never the partial output. Past the ceiling the last hop's
         # CONTINUATION finish translates to ``length``.
         while (token := continuation_token(hops[-1])) and len(hops) < max_hops:
-            hops.append(self._generate(url + self.GENERATE_METHOD, {**request, "continuationToken": token}, timeout))
+            hops.append(self._generate(url + self.GENERATE_METHOD, {**request, "continuationToken": token}, timeout, extra_headers=req_headers))
         return translate_gemini_response(merge_hop_responses(hops) if len(hops) > 1 else hops[0], model=model)
 
-    def _generate(self, url: str, request: dict[str, Any], timeout: Any) -> dict[str, Any]:
-        response = self._http.post(url, json=request, headers=self._headers(), timeout=timeout)
+    def _generate(self, url: str, request: dict[str, Any], timeout: Any, *, extra_headers: Optional[dict[str, str]] = None) -> dict[str, Any]:
+        headers = {**self._headers(), **extra_headers} if extra_headers else self._headers()
+        response = self._http.post(url, json=request, headers=headers, timeout=timeout)
         if response.status_code != 200:
             raise self._http_error(response)
         try:
@@ -959,7 +961,7 @@ class GeminiNativeClient:
                 f"Invalid JSON from Gemini native API: {exc}", code="gemini_invalid_json", status_code=response.status_code, response=response,
             ) from exc
 
-    def _stream_completion(self, model: str, url: str, request: dict[str, Any], timeout: Any) -> Iterator[_GeminiStreamChunk]:
+    def _stream_completion(self, model: str, url: str, request: dict[str, Any], timeout: Any, *, extra_headers: Optional[dict[str, str]] = None) -> Iterator[_GeminiStreamChunk]:
         tool_call_indices: dict[str, dict[str, Any]] = {}  # shared across hops: they form one model turn
         hop_usage: list[dict[str, Any]] = []
         max_hops = long_decode_hops(request["generationConfig"].get("maxOutputTokens")) + 1
@@ -969,7 +971,7 @@ class GeminiNativeClient:
         resume, sends = None, 0
         while True:
             try:
-                headers = {**self._headers(), "Accept": "text/event-stream"}
+                headers = {**self._headers(), **(extra_headers or {}), "Accept": "text/event-stream"}
                 with self._http.stream("POST", url, json=body, headers=headers, timeout=timeout) as response:
                     if response.status_code != 200:
                         raise self._http_error(response, read_streaming_error_body(response))
