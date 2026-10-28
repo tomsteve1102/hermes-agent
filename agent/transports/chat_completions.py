@@ -636,6 +636,15 @@ class ChatCompletionsTransport(ProviderTransport):
                     extra_body["extra_body"] = openai_compat_extra
             elif raw_thinking_config:
                 extra_body["thinking_config"] = raw_thinking_config
+        else:
+            try:
+                from agent.gemini_native_adapter import is_native_gemini_base_url
+                if is_native_gemini_base_url(base_url):
+                    raw_thinking_config = _build_gemini_thinking_config(model, reasoning_config)
+                    if raw_thinking_config:
+                        extra_body["thinking_config"] = raw_thinking_config
+            except Exception:
+                pass
 
         if params.get("extra_body_additions"):
             extra_body.update(params["extra_body_additions"])
@@ -684,19 +693,29 @@ class ChatCompletionsTransport(ProviderTransport):
             else:
                 api_kwargs[k] = v
 
+        # Native Gemini speaks Google's REST schema: OpenAI-style extra_body
+        # keys (tags, reasoning, provider, ...) are unknown fields -> HTTP 400.
+        # The native client reads only thinking_config and the long-decode budget.
+        # Custom providers routed to a native Gemini endpoint (e.g. /google/v1beta)
+        # use CustomProfile rather than GeminiProfile, so populate thinking_config here
+        # when the profile did not already supply one.
+        try:
+            from agent.gemini_native_adapter import is_native_gemini_base_url
+            _native_gemini = is_native_gemini_base_url(params.get("base_url"))
+        except Exception:
+            _native_gemini = False
+        if _native_gemini:
+            if "thinking_config" not in extra_body and "thinkingConfig" not in extra_body:
+                raw_thinking_config = _build_gemini_thinking_config(model, reasoning_config)
+                if raw_thinking_config:
+                    extra_body["thinking_config"] = raw_thinking_config
+                from agent.gemini_long_decode import long_decode_max_output_tokens
+                budget = long_decode_max_output_tokens(model or "", reasoning_config)
+                if budget and "max_output_tokens" not in extra_body:
+                    extra_body["max_output_tokens"] = budget
+            extra_body = {k: v for k, v in extra_body.items() if k in ("thinking_config", "thinkingConfig", "max_output_tokens")}
         if extra_body:
-            # Native Gemini speaks Google's REST schema: OpenAI-style extra_body
-            # keys (tags, reasoning, provider, ...) are unknown fields -> HTTP 400.
-            # The native client reads only thinking_config and the long-decode budget.
-            try:
-                from agent.gemini_native_adapter import is_native_gemini_base_url
-                _native_gemini = is_native_gemini_base_url(params.get("base_url"))
-            except Exception:
-                _native_gemini = False
-            if _native_gemini:
-                extra_body = {k: v for k, v in extra_body.items() if k in ("thinking_config", "thinkingConfig", "max_output_tokens")}
-            if extra_body:
-                api_kwargs["extra_body"] = extra_body
+            api_kwargs["extra_body"] = extra_body
         return _finish_kwargs(
             api_kwargs, sanitized, params, supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False)),
         )
