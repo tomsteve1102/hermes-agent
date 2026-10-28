@@ -64,6 +64,11 @@ async def prepare_compress(authority, live, payload, prepared):
     # (cold session, or a managed worker that runs out of process) means no provider to call.
     cached_agent = getattr(authority.runner, '_cached_agent_for', None)
     resident = cached_agent(live.route) if callable(cached_agent) else None
+    from agent.conversation_compression import CompressionCommitFence
+    from agent.conversation_compression_deadline import resolve_context_compression_timeouts
+    _idle_timeout, total_ceiling = resolve_context_compression_timeouts(options)
+    commit_fence = CompressionCommitFence(total_ceiling if total_ceiling > 0 else None)
+    compressor_holder = [None]
 
     def summarize():
         with policy_scope(policy, authority=authority):
@@ -75,18 +80,46 @@ async def prepare_compress(authority, live, payload, prepared):
                 protect_first_n=options.get('protect_first_n', 3), protect_last_n=options.get('protect_last_n', 20),
                 min_tail_user_messages=max(1, _parse_config_int(options.get('min_tail_user_messages', 1), 1)),
                 custom_providers=config.get('custom_providers'))
+            compressor_holder[0] = compressor
             # 会话 id 就在 snapshot 上，但这个临时 compressor 从没绑过 —— 不绑的话所有依赖
             # session 的功能（recovery footer、陈旧 tool 降级、durable cooldown 键）都在空 id
             # 下静默跑（2026-10-27 修）。缺了 footer，模型就不知道被压缩的原文还能搜回来。
             from contextlib import suppress as _suppress_bind
             with _suppress_bind(Exception):
                 compressor.bind_session_state(getattr(authority, "db", None), snapshot.get("target") or "")
-            compressed = compressor.compress(json.loads(json.dumps(head)), force=True,
-                                               focus_topic=request.focus_topic, memory_context=memory_context)
+            # 接上与自动压缩相同的流式进度钩子与截止时间死线（2026-10-28 修）：
+            # 不挂 aux_progress_hook 时底层退化为同步阻塞 create()，60s 无进展看门狗与总上限全部失效。
+            from agent.auxiliary_client import aux_interrupt_protection, aux_progress_hook
+            from agent.conversation_compression_deadline import compression_deadline_scope
+            compressor._compression_cancelled_check = lambda: commit_fence.is_cancelled
+            with (
+                aux_progress_hook(commit_fence.touch_progress),
+                compression_deadline_scope(commit_fence),
+                aux_interrupt_protection(cancel_check=lambda: commit_fence.is_cancelled),
+            ):
+                compressed = compressor.compress(json.loads(json.dumps(head)), force=True,
+                                                   focus_topic=request.focus_topic, memory_context=memory_context)
             if not any(m.get('_compressed_summary') for m in compressed):
                 return None, compressor
             return rejoin_compressed_head_and_tail(compressed, tail), compressor
-    compressed, compressor = await asyncio.to_thread(summarize)
+
+    coro = asyncio.to_thread(summarize)
+    try:
+        compressed, compressor = (
+            await asyncio.wait_for(coro, timeout=total_ceiling)
+            if total_ceiling > 0 else await coro
+        )
+    except asyncio.TimeoutError:
+        commit_fence.try_cancel_before_commit()
+        logger.warning(
+            "Manual /compress timed out after %.0fs (session=%s)",
+            total_ceiling, snapshot.get("target") or "none",
+        )
+        compressor = compressor_holder[0]
+        if compressor is not None:
+            compressor._last_compress_aborted = True
+            compressor._last_summary_error = f"manual /compress timed out after {int(total_ceiling)}s"
+        compressed = None
     # The same report every native /compress prints ("Compressed: N → M messages").
     from agent.manual_compression_feedback import summarize_manual_compression
     if compressed is None:
