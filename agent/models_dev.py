@@ -194,6 +194,10 @@ def _configured_catalog_provider(
         alias = next((e.get("catalog_provider") for e in (legacy if isinstance(legacy, list) else [])
                       if isinstance(e, dict) and str(e.get("name") or "").strip() == name), None)
     alias = str(alias or "").strip()
+    if not alias and name.lower().startswith("opencode-go"):
+        raw_url = str(_dict_or_empty(provider_config).get("base_url") or _dict_or_empty(provider_config).get("api") or "").lower()
+        if "opencode.ai" in raw_url:
+            alias = "opencode-go"
     return alias or None
 
 
@@ -203,7 +207,8 @@ def _models_dev_id(
     """models.dev provider id for a Hermes provider id, or None. A custom provider reaches the
     catalog only through its configured ``catalog_provider`` alias (#112649)."""
     key = (provider or "").strip()
-    mdev_id = models_dev_id_for(key)
+    stripped = key[len("custom:"):] if key.lower().startswith("custom:") else key
+    mdev_id = models_dev_id_for(stripped)
     if mdev_id is None:
         alias = _configured_catalog_provider(key, config=config)
         mdev_id = (models_dev_id_for(alias) or alias) if alias else None

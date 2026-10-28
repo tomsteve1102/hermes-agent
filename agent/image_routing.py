@@ -364,6 +364,13 @@ def _lookup_supports_vision(
     for label, probe in _VISION_PROBES:
         try:
             verdict = probe(provider, model, cfg)
+            if (
+                verdict is None
+                and probe is _probe_models_dev
+                and requested_provider
+                and requested_provider.lower() != _clean_str(provider).lower()
+            ):
+                verdict = probe(requested_provider, model, cfg)
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("image_routing: %s failed for %s:%s — %s", label, provider, model, exc)
             continue
