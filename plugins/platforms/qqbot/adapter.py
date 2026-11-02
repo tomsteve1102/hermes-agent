@@ -969,9 +969,14 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         recent = self._group_recent.setdefault(group_openid, [])
         recent.append((msg_id, member, str(author.get("username") or "")))
         del recent[: -self._GROUP_RECENT_MAX]
+        # [tamako-local] Pass the sender nickname: with group_sessions_per_user=false the group
+        # shares ONE session, and gateway/run_inbound.py attributes each turn with a "[nick] "
+        # prefix — only when source.user_name is set. QQ group events carry it in author.username;
+        # without it every member's turn lands unattributed and the shared history becomes mush.
         await self._ingest(
             d, msg_id, body, d.get("attachments"), timestamp,
-            chat_id=group_openid, qq_chat_type="group", user_id=member, chat_type="group")
+            chat_id=group_openid, qq_chat_type="group", user_id=member,
+            user_name=(str(author.get("username") or "").strip() or None), chat_type="group")
 
     async def _handle_guild_message(self, d, msg_id, content, author, timestamp) -> None:
         channel_id = str(d.get("channel_id", ""))
