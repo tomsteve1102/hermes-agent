@@ -1421,6 +1421,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             # See #17916.
             if source.platform == Platform.SLACK and source.user_id:
                 _safe_user_name = f"{_safe_user_name} | Slack user <@{source.user_id}>"
+            # [tamako-local] QQ 群成员的 display name 会重名、也会被随手改；openid 才是稳定身份。
+            # 前缀里带上短 openid，认人表（qq-gateway/references/gateway-incidents-and-roster.md）
+            # 才能直接从一条群消息对齐到人，不必再去翻聊天日志反查。
+            elif source.platform == Platform.QQBOT and source.user_id:
+                _safe_user_name = f"{_safe_user_name}#{source.user_id[:8]}"
             message_text = f"[{_safe_user_name}] {message_text}"
         # After the sender-prefix so the prefix applies only to the trigger message, not the backfill.
         if getattr(event, "channel_context", None):

@@ -969,6 +969,11 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         recent = self._group_recent.setdefault(group_openid, [])
         recent.append((msg_id, member, str(author.get("username") or "")))
         del recent[: -self._GROUP_RECENT_MAX]
+        # [tamako-local] 群消息落一行带 openid 的日志：author.username 只有昵称，重名/改名之后
+        # 无法与认人表对齐（11-03 就撞上一次：群里 2389154210 疑似抹茶，却拿不到他的 member_openid）。
+        logger.info(
+            "[%s] group msg sender: member_openid=%s username=%r group=%s",
+            self._log_tag, member or "?", str(author.get("username") or ""), group_openid[:12])
         # [tamako-local] Pass the sender nickname: with group_sessions_per_user=false the group
         # shares ONE session, and gateway/run_inbound.py attributes each turn with a "[nick] "
         # prefix — only when source.user_name is set. QQ group events carry it in author.username;
